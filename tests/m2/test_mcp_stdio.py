@@ -27,7 +27,12 @@ EXPECTED_TOOLS = {
     "nx_ensure_ready",
     "nx_get_capabilities", "nx_bridge_status", "nx_bridge_ping", "nx_takeover", "nx_return",
     "nx_get_session", "nx_inspect_part", "nx_inspect_sketch", "nx_query_faces", "nx_get_operation",
-    "nx_cancel_operation", "nx_prepare_operation", "nx_prepare_sketch", "nx_prepare_extrude",
+    "nx_cancel_operation", "nx_prepare_operation", "nx_prepare_sketch", "nx_prepare_datum_plane", "nx_prepare_extrude", "nx_prepare_revolve", "nx_prepare_hole",
+    "nx_prepare_sketch_corner", "nx_edit_sketch_corner",
+    "nx_prepare_sketch_offset", "nx_edit_sketch_offset",
+    "nx_prepare_sketch_pattern", "nx_edit_sketch_pattern",
+    "nx_prepare_sketch_projection", "nx_edit_sketch_projection",
+    "nx_prepare_sketch_reference_conversion", "nx_edit_sketch_reference_conversion",
     "nx_prepare_thread", "nx_prepare_helical_groove",
     "nx_execute_plan", "nx_verify_part", "nx_save_copy",
 }
@@ -99,18 +104,50 @@ class McpStdioProcessTests(unittest.TestCase):
         self.assertEqual(payload.get("available_operations"), [
             "bridge.status", "bridge.dispatch_probe", "ownership.takeover", "ownership.return",
             "model.get_session", "model.inspect_part", "model.inspect_sketch", "model.query_faces", "operation.get",
-            "operation.cancel", "operation.prepare", "operation.prepare_sketch", "operation.prepare_extrude",
+            "operation.cancel", "operation.prepare", "operation.prepare_sketch",
+            "operation.prepare_sketch_corner", "operation.edit_sketch_corner",
+            "operation.prepare_sketch_offset", "operation.edit_sketch_offset",
+            "operation.prepare_sketch_pattern", "operation.edit_sketch_pattern",
+            "operation.prepare_sketch_projection", "operation.edit_sketch_projection",
+            "operation.prepare_sketch_reference_conversion", "operation.edit_sketch_reference_conversion",
+            "operation.prepare_datum_plane", "operation.prepare_extrude", "operation.prepare_revolve",
             "operation.prepare_thread", "operation.prepare_helical_groove",
             "operation.execute_plan", "operation.verify_part",
             "operation.save_copy",
         ])
-        self.assertEqual(payload.get("read_support", {}).get("sketch_geometry_detail"), ["LINE", "ARC"])
+        self.assertEqual(payload.get("read_support", {}).get("sketch_geometry_detail"),
+                         ["LINE", "ARC", "ELLIPSE", "ELLIPTICAL_ARC", "SPLINE"])
         native_geometry = payload.get("model_native_geometry_support", {})
         sketch_support = native_geometry.get("sketch", {})
         self.assertEqual(sketch_support.get("planes"), ["XY", "XZ", "YZ"])
         self.assertEqual(sketch_support.get("face_mode", {}).get("argument"), "support_face_selector")
         self.assertTrue(any("M4_SUBTRACT_CONTOUR_EDIT_UNSUPPORTED" in item
                             for item in native_geometry.get("limitations", [])))
+        pattern_support = native_geometry.get("sketch_pattern", {})
+        self.assertEqual(pattern_support.get("prepare_operation"), "operation.prepare_sketch_pattern")
+        self.assertEqual(pattern_support.get("edit_operation"), "operation.edit_sketch_pattern")
+        self.assertEqual(pattern_support.get("modes"), ["linear", "rectangular", "circular", "mirror"])
+        self.assertEqual(pattern_support.get("supported_curve_types"), ["LINE", "ARC"])
+        self.assertEqual(pattern_support.get("arc_scope"), "partial arcs and full circles")
+        self.assertIn("negative steps are allowed", pattern_support.get("angle_step", ""))
+        self.assertEqual(pattern_support.get("limits", {}).get("total_positions"), 256)
+        self.assertEqual(pattern_support.get("limits", {}).get("total_positions_times_source_curves"), 4096)
+        projection_support = native_geometry.get("sketch_projection", {})
+        self.assertEqual(projection_support.get("prepare_operation"), "operation.prepare_sketch_projection")
+        self.assertEqual(projection_support.get("edit_operation"), "operation.edit_sketch_projection")
+        self.assertEqual(projection_support.get("request_fields"), [
+            "operation_id", "ownership_id", "binding_epoch", "revision_id", "sketch_id",
+            "source_curve_ids", "direction_xyz", "associative",
+        ])
+        self.assertIn("±target sketch normal", projection_support.get("supported_direction", ""))
+        self.assertIn("reject", projection_support.get("supported_direction", ""))
+        reference_conversion = native_geometry.get("sketch_reference_conversion", {})
+        self.assertEqual(reference_conversion.get("prepare_operation"), "operation.prepare_sketch_reference_conversion")
+        self.assertEqual(reference_conversion.get("edit_operation"), "operation.edit_sketch_reference_conversion")
+        self.assertEqual(reference_conversion.get("supported_dimension_types"), ["HorizontalDim", "VerticalDim"])
+        self.assertEqual(reference_conversion.get("supported_curve_types"), ["Line", "Arc"])
+        self.assertIn("ComputedSize", reference_conversion.get("dimension_semantics", ""))
+        self.assertIn("EntireSketch", reference_conversion.get("solver_evaluation", ""))
         self.assertEqual(payload.get("model_access"), {
             "read": False, "write": False, "control": False,
         })
@@ -180,6 +217,41 @@ class McpStdioProcessTests(unittest.TestCase):
         self.assertEqual(save_schema["properties"]["target_path"]["type"], "string")
         self.assertEqual(save_schema["properties"]["reopen"]["type"], "boolean")
         self.assertEqual(save_schema["additionalProperties"], False)
+
+        shared_pattern_fields = {
+            "operation_id", "ownership_id", "binding_epoch", "revision_id", "sketch_id",
+            "source_curve_ids", "mode",
+        }
+        for name in ("nx_prepare_sketch_pattern", "nx_edit_sketch_pattern"):
+            pattern_tool = by_name[name]
+            schema = pattern_tool["inputSchema"]
+            self.assertTrue(shared_pattern_fields <= set(schema["required"]), (name, schema))
+            self.assertEqual(schema["properties"]["mode"]["enum"],
+                             ["linear", "rectangular", "circular", "mirror"])
+            self.assertEqual(schema["properties"]["source_curve_ids"]["minItems"], 1)
+            self.assertEqual(schema["properties"]["source_curve_ids"]["maxItems"], 256)
+            self.assertIs(schema["properties"]["source_curve_ids"]["uniqueItems"], True)
+            self.assertIs(schema["additionalProperties"], False)
+        self.assertIs(by_name["nx_prepare_sketch_pattern"]["annotations"]["readOnlyHint"], True)
+        self.assertIs(by_name["nx_edit_sketch_pattern"]["annotations"]["destructiveHint"], True)
+
+        projection_fields = {
+            "operation_id", "ownership_id", "binding_epoch", "revision_id", "sketch_id",
+            "source_curve_ids", "direction_xyz", "associative",
+        }
+        for name in ("nx_prepare_sketch_projection", "nx_edit_sketch_projection"):
+            tool = by_name[name]
+            schema = tool["inputSchema"]
+            self.assertEqual(set(schema["required"]), projection_fields, (name, schema))
+            self.assertEqual(schema["properties"]["source_curve_ids"]["minItems"], 1)
+            self.assertEqual(schema["properties"]["source_curve_ids"]["maxItems"], 128)
+            self.assertIs(schema["properties"]["source_curve_ids"]["uniqueItems"], True)
+            self.assertEqual(schema["properties"]["direction_xyz"]["minItems"], 3)
+            self.assertEqual(schema["properties"]["direction_xyz"]["maxItems"], 3)
+            self.assertEqual(schema["properties"]["associative"]["type"], "boolean")
+            self.assertIs(schema["additionalProperties"], False)
+        self.assertIs(by_name["nx_prepare_sketch_projection"]["annotations"]["readOnlyHint"], True)
+        self.assertIs(by_name["nx_edit_sketch_projection"]["annotations"]["destructiveHint"], True)
 
     def test_capabilities_reflect_cached_ownership_state_and_bridge_failure(self):
         config = config_from_object({
@@ -266,7 +338,25 @@ class McpStdioProcessTests(unittest.TestCase):
     def test_ownership_and_model_tools_route_arguments_to_bridge_commands(self):
         server = McpServer(config_from_object({}))
         self.addCleanup(server.close)
-        bridge_call = Mock(return_value={"ok": True})
+        def bridge_response(command, params):
+            if command == "operation.edit_sketch_pattern":
+                return {
+                    "state": "SUCCEEDED", "verified": True,
+                    "result": {"kind": "edit_sketch_pattern", "mutation_state": "APPLIED", "verified": True},
+                }
+            if command == "operation.edit_sketch_projection":
+                return {
+                    "state": "SUCCEEDED", "kind": "execute_edit_sketch_projection",
+                    "result": {"kind": "edit_sketch_projection", "mutation_state": "APPLIED", "verified": True},
+                }
+            if command == "operation.edit_sketch_reference_conversion":
+                return {
+                    "state": "SUCCEEDED", "kind": "execute_edit_sketch_reference_conversion",
+                    "result": {"kind": "edit_sketch_reference_conversion", "mutation_state": "APPLIED", "verified": True},
+                }
+            return {"ok": True}
+
+        bridge_call = Mock(side_effect=bridge_response)
         server._bridge.call = bridge_call
 
         routed_calls = [
@@ -328,6 +418,61 @@ class McpStdioProcessTests(unittest.TestCase):
                 "operation_id": "op-m3-extrude", "ownership_id": "own-m3-extrude", "binding_epoch": 20,
                 "revision_id": "11", "sketch_id": "sketch-m3", "mode": "unite",
                 "direction": "negative", "extent": "through_all", "target_body_id": "body-m3",
+                "profile_output": "solid", "start_offset_mm": 0.0,
+            }),
+            ("nx_prepare_sketch_pattern", {
+                "operation_id": "op-m3-pattern", "ownership_id": "own-m3-pattern", "binding_epoch": 21,
+                "revision_id": "12", "sketch_id": "sketch-pattern", "source_curve_ids": ["seed-line"],
+                "mode": "linear", "direction_xy": [1, 0], "spacing_mm": 5, "instance_count": 3,
+            }, "operation.prepare_sketch_pattern", {
+                "operation_id": "op-m3-pattern", "ownership_id": "own-m3-pattern", "binding_epoch": 21,
+                "revision_id": "12", "sketch_id": "sketch-pattern", "source_curve_ids": ["seed-line"],
+                "mode": "linear", "direction_xy": [1, 0], "spacing_mm": 5, "instance_count": 3,
+            }),
+            ("nx_edit_sketch_pattern", {
+                "operation_id": "op-m3-pattern-edit", "ownership_id": "own-m3-pattern", "binding_epoch": 21,
+                "revision_id": "12", "sketch_id": "sketch-pattern", "source_curve_ids": ["seed-line"],
+                "mode": "mirror", "axis_curve_id": "axis-line",
+            }, "operation.edit_sketch_pattern", {
+                "operation_id": "op-m3-pattern-edit", "ownership_id": "own-m3-pattern", "binding_epoch": 21,
+                "revision_id": "12", "sketch_id": "sketch-pattern", "source_curve_ids": ["seed-line"],
+                "mode": "mirror", "axis_curve_id": "axis-line",
+            }),
+            ("nx_prepare_sketch_projection", {
+                "operation_id": "op-m3-projection", "ownership_id": "own-m3-projection", "binding_epoch": 22,
+                "revision_id": "13", "sketch_id": "sketch-projection", "source_curve_ids": ["edge-id", "space-line-id"],
+                "direction_xyz": [0.0, 0.0, -2.0], "associative": True,
+            }, "operation.prepare_sketch_projection", {
+                "operation_id": "op-m3-projection", "ownership_id": "own-m3-projection", "binding_epoch": 22,
+                "revision_id": "13", "sketch_id": "sketch-projection", "source_curve_ids": ["edge-id", "space-line-id"],
+                "direction_xyz": [0.0, 0.0, -1.0], "associative": True,
+            }),
+            ("nx_edit_sketch_projection", {
+                "operation_id": "op-m3-projection-edit", "ownership_id": "own-m3-projection", "binding_epoch": 22,
+                "revision_id": "13", "sketch_id": "sketch-projection", "source_curve_ids": ["edge-id"],
+                "direction_xyz": [0.0, 0.0, 3.0], "associative": False,
+            }, "operation.edit_sketch_projection", {
+                "operation_id": "op-m3-projection-edit", "ownership_id": "own-m3-projection", "binding_epoch": 22,
+                "revision_id": "13", "sketch_id": "sketch-projection", "source_curve_ids": ["edge-id"],
+                "direction_xyz": [0.0, 0.0, 1.0], "associative": False,
+            }),
+            ("nx_prepare_sketch_reference_conversion", {
+                "operation_id": "op-m3-reference-prepare", "ownership_id": "own-m3-reference", "binding_epoch": 23,
+                "revision_id": "14", "sketch_id": "sketch-reference", "object_ids": ["line-jid", "dim-jid"],
+                "target_state": "reference",
+            }, "operation.prepare_sketch_reference_conversion", {
+                "operation_id": "op-m3-reference-prepare", "ownership_id": "own-m3-reference", "binding_epoch": 23,
+                "revision_id": "14", "sketch_id": "sketch-reference", "object_ids": ["line-jid", "dim-jid"],
+                "target_state": "reference",
+            }),
+            ("nx_edit_sketch_reference_conversion", {
+                "operation_id": "op-m3-reference-edit", "ownership_id": "own-m3-reference", "binding_epoch": 23,
+                "revision_id": "14", "sketch_id": "sketch-reference", "object_ids": ["line-jid", "dim-jid"],
+                "target_state": "active",
+            }, "operation.edit_sketch_reference_conversion", {
+                "operation_id": "op-m3-reference-edit", "ownership_id": "own-m3-reference", "binding_epoch": 23,
+                "revision_id": "14", "sketch_id": "sketch-reference", "object_ids": ["line-jid", "dim-jid"],
+                "target_state": "active",
             }),
             ("nx_execute_plan", {
                 "operation_id": "op-4", "ownership_id": "own-6", "binding_epoch": 16, "plan_id": "plan-8",
@@ -378,7 +523,69 @@ class McpStdioProcessTests(unittest.TestCase):
             "error": {"code": "OWNERSHIP_REQUIRED", "message": "session is not AI_OWNED"},
         })
 
-    def test_execute_unknown_client_gate_waits_for_queried_terminal_result(self):
+    def test_legacy_operation_poll_preserves_records_and_keeps_local_unknown_gate(self):
+        server = McpServer(config_from_object({}))
+        self.addCleanup(server.close)
+        records = {
+            "legacy-running": {
+                "ok": True, "operation_id": "legacy-running", "kind": "execute_sketch",
+                "state": "RUNNING", "result": {"phase": "applying", "legacy_marker": "running"},
+                "error": None, "writes_halted": False, "write_halt_reason": None,
+            },
+            "legacy-unknown": {
+                "ok": True, "operation_id": "legacy-unknown", "kind": "execute_sketch",
+                "state": "UNKNOWN", "result": {"mutation_state": "UNKNOWN", "legacy_marker": "unknown"},
+                "error": {"code": "OPERATION_OUTCOME_UNKNOWN", "message": "native outcome unresolved"},
+                "writes_halted": True, "write_halt_reason": "NATIVE_OUTCOME_UNKNOWN",
+            },
+        }
+        bridge_calls = []
+
+        def bridge_call(command, params):
+            bridge_calls.append((command, dict(params)))
+            if command == "operation.get":
+                return records[params["operation_id"]]
+            if command == "operation.execute_plan" and params["operation_id"] == "legacy-unknown":
+                return records["legacy-unknown"]
+            if command == "operation.execute_plan":
+                raise BridgeFailure("OPERATION_OUTCOME_UNKNOWN", "bridge writes are frozen by the unresolved native operation")
+            raise AssertionError("unexpected bridge command: " + command)
+
+        server._bridge.call = Mock(side_effect=bridge_call)
+        for operation_id in ("legacy-running", "legacy-unknown"):
+            response = server._tools_call(31, {
+                "name": "nx_get_operation", "arguments": {"operation_id": operation_id},
+            })
+            tool_result = response.get("result")
+            self.assertIsInstance(tool_result, dict, response)
+            self.assertIs(tool_result.get("isError"), False, response)
+            self.assertEqual(extract_structured_result(tool_result), records[operation_id])
+
+        self.assertEqual(server._unknown_operation_ids, {"legacy-unknown"})
+        replay = server._tools_call(32, {
+            "name": "nx_execute_plan",
+            "arguments": {
+                "operation_id": "legacy-unknown", "ownership_id": "owner-1",
+                "binding_epoch": 1, "plan_id": "plan-1",
+            },
+        })
+        self.assertIs(replay["result"].get("isError"), True, replay)
+        self.assertEqual(extract_structured_result(replay["result"]).get("error", {}).get("code"), "CLIENT_OUTCOME_UNKNOWN")
+
+        blocked = server._tools_call(33, {
+            "name": "nx_execute_plan",
+            "arguments": {
+                "operation_id": "legacy-new-write", "ownership_id": "owner-1",
+                "binding_epoch": 1, "plan_id": "plan-2",
+            },
+        })
+        self.assertIs(blocked["result"].get("isError"), True, blocked)
+        self.assertEqual(extract_structured_result(blocked["result"]).get("error", {}).get("code"),
+                         "CLIENT_OUTCOME_UNKNOWN", blocked)
+        self.assertEqual([item[1]["operation_id"] for item in bridge_calls if item[0] == "operation.execute_plan"],
+                         [])
+
+    def test_execute_unknown_client_gate_remains_after_terminal_result(self):
         terminal_states = ("SUCCEEDED", "FAILED", "CANCELLED")
         for terminal_state in terminal_states:
             with self.subTest(terminal_state=terminal_state):
@@ -461,23 +668,24 @@ class McpStdioProcessTests(unittest.TestCase):
                 terminal_record = extract_structured_result(terminal["result"])
                 self.assertEqual(terminal_record.get("state"), terminal_state, terminal_record)
                 self.assertIs(terminal_record.get("writes_halted"), False, terminal_record)
-                released = server._capabilities()
-                self.assertIs(released.get("model_write_enabled"), True, released)
-                self.assertNotIn("unknown_operation_ids", released)
+                held = server._capabilities()
+                self.assertIs(held.get("model_write_enabled"), False, held)
+                self.assertEqual(held.get("unknown_operation_ids"), [operation_id], held)
 
                 next_args = dict(original_args)
-                next_args["operation_id"] = "write-after-reconcile"
+                next_args["operation_id"] = "write-after-terminal"
                 next_write = server._tools_call(25, {"name": "nx_execute_plan", "arguments": next_args})
-                self.assertIs(next_write["result"].get("isError"), False, next_write)
+                self.assertIs(next_write["result"].get("isError"), True, next_write)
+                self.assertEqual(extract_structured_result(next_write["result"]).get("error", {}).get("code"), "CLIENT_OUTCOME_UNKNOWN")
                 execute_calls = [item for item in calls if item[0] == "operation.execute_plan"]
-                self.assertEqual([item[1]["operation_id"] for item in execute_calls], [operation_id, "write-after-reconcile"])
+                self.assertEqual([item[1]["operation_id"] for item in execute_calls], [operation_id])
                 record("M2-5-client-unknown-gate", {
                     "resolved_terminal_state": terminal_state,
                     "initial_bridge_timeout": True,
                     "running_record_kept_writes_halted": True,
                     "new_write_blocked_before_resolution": True,
                     "original_execute_call_count": 1,
-                    "writes_resumed_after_query": True,
+                    "writes_remain_blocked_after_terminal": True,
                 })
 
     def test_takeover_requires_the_explicit_confirmation_phrase(self):

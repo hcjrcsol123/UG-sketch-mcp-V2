@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Globalization;
 using NXOpen;
 using NXOpen.Features;
+using NXOpen.UF;
 
 // Small NXOpen construction helpers used by the M3 operation adapter.  These
 // helpers intentionally use only the creation patterns exercised by the
@@ -55,7 +56,6 @@ public sealed class M3CircleResult
 public static class M3NxFeatureFactory
 {
     private const double AxisTolerance = 1e-9;
-    private const double PointTolerance = 1e-7;
     private const double Pi = Math.PI;
 
     private sealed class SketchFrame
@@ -82,8 +82,32 @@ public static class M3NxFeatureFactory
         Vector3d u, v, normal;
         GetAxes(plane, out u, out v, out normal);
 
+        return CreateSketch(part, origin, normal, u);
+    }
+
+    /// <summary>Creates a native sketch on a world-space plane frame.</summary>
+    public static Sketch CreateSketch(Part part, Point3d origin, Vector3d normal, Vector3d xAxis)
+    {
+        RequirePart(part);
+        RequireFinite(origin.X, "origin X");
+        RequireFinite(origin.Y, "origin Y");
+        RequireFinite(origin.Z, "origin Z");
+        NormalizeFrame(ref normal, ref xAxis);
         Plane sketchPlane = part.Planes.CreatePlane(origin, normal, SmartObject.UpdateOption.WithinModeling);
-        Direction axisReference = part.Directions.CreateDirection(origin, u, SmartObject.UpdateOption.WithinModeling);
+        return CreateSketchOnPlane(part, sketchPlane, origin, normal, xAxis);
+    }
+
+    /// <summary>Creates a sketch using an existing associative NX plane reference.</summary>
+    public static Sketch CreateSketchOnPlane(Part part, Plane sketchPlane, Point3d origin,
+        Vector3d normal, Vector3d xAxis)
+    {
+        RequirePart(part);
+        if (sketchPlane == null) throw new ArgumentNullException("sketchPlane");
+        RequireFinite(origin.X, "origin X");
+        RequireFinite(origin.Y, "origin Y");
+        RequireFinite(origin.Z, "origin Z");
+        NormalizeFrame(ref normal, ref xAxis);
+        Direction axisReference = part.Directions.CreateDirection(origin, xAxis, SmartObject.UpdateOption.WithinModeling);
         Point sketchOrigin = part.Points.CreatePoint(origin);
 
         SketchInPlaceBuilder builder = part.Sketches.CreateSketchInPlaceBuilder2(null);
@@ -101,6 +125,158 @@ public static class M3NxFeatureFactory
         finally
         {
             builder.Destroy();
+        }
+    }
+
+    /// <summary>Creates an associative native DatumPlane feature with a requested display frame.</summary>
+    public static Feature CreateDatumPlane(Part part, Point3d origin, Vector3d normal, Vector3d xAxis)
+    {
+        RequirePart(part);
+        RequireFinite(origin.X, "origin X");
+        RequireFinite(origin.Y, "origin Y");
+        RequireFinite(origin.Z, "origin Z");
+        NormalizeFrame(ref normal, ref xAxis);
+        Vector3d yAxis = Cross(normal, xAxis);
+        Matrix3x3 orientation = new Matrix3x3();
+        orientation.Xx = xAxis.X; orientation.Xy = xAxis.Y; orientation.Xz = xAxis.Z;
+        orientation.Yx = yAxis.X; orientation.Yy = yAxis.Y; orientation.Yz = yAxis.Z;
+        orientation.Zx = normal.X; orientation.Zy = normal.Y; orientation.Zz = normal.Z;
+        DatumPlaneBuilder builder = part.Features.CreateDatumPlaneBuilder(null);
+        try
+        {
+            Plane plane = builder.GetPlane();
+            if (plane == null) throw new InvalidOperationException("DatumPlaneBuilder returned no defining Plane.");
+            plane.SetMethod(PlaneTypes.MethodType.Fixed);
+            plane.EditFixedPlane(origin, orientation);
+            plane.Evaluate();
+            return builder.CommitFeature();
+        }
+        finally
+        {
+            builder.Destroy();
+        }
+    }
+
+    /// <summary>Creates a native associative offset DatumPlane from a planar Face or DatumPlane.</summary>
+    public static Feature CreateOffsetDatumPlane(Part part, NXObject reference, double signedDistanceMm)
+    {
+        RequirePart(part);
+        RequireFinite(signedDistanceMm, "signed offset distance");
+        if (!(reference is Face) && !(reference is DatumPlane))
+            throw new ArgumentException("offset DatumPlane reference must be a planar Face or DatumPlane", "reference");
+
+        string stage = "CreateDatumPlaneBuilder";
+        DatumPlaneBuilder builder = null;
+        try
+        {
+            builder = part.Features.CreateDatumPlaneBuilder(null);
+            stage = "GetPlane";
+            Plane plane = builder.GetPlane();
+            if (plane == null) throw new InvalidOperationException("DatumPlaneBuilder returned no defining Plane.");
+            stage = "SetMethod(Distance)";
+            plane.SetMethod(PlaneTypes.MethodType.Distance);
+            stage = "SetGeometry";
+            plane.SetGeometry(new NXObject[] { reference });
+            stage = "SetExpression";
+            string expression = signedDistanceMm.ToString("R", CultureInfo.InvariantCulture);
+            plane.SetExpression(expression);
+            stage = "Evaluate";
+            plane.Evaluate();
+            stage = "CommitFeature";
+            return builder.CommitFeature();
+        }
+        catch (Exception ex)
+        {
+            throw new InvalidOperationException("NX offset DatumPlane failed at " + stage + ": " +
+                ex.GetType().Name + ": " + ex.Message, ex);
+        }
+        finally
+        {
+            if (builder != null) try { builder.Destroy(); } catch { }
+        }
+    }
+
+    /// <summary>Creates an associative native angle DatumPlane with a right-hand signed angle about a native Line.</summary>
+    public static Feature CreateAngleDatumPlane(Part part, NXObject reference, Line axisLine, double rightHandAngleDeg)
+    {
+        RequirePart(part);
+        RequireFinite(rightHandAngleDeg, "angle DatumPlane angle");
+        if (rightHandAngleDeg < -180.0 || rightHandAngleDeg > 180.0)
+            throw new ArgumentOutOfRangeException("rightHandAngleDeg", "angle DatumPlane angle must be between -180 and 180 degrees");
+        if (!(reference is Face) && !(reference is DatumPlane))
+            throw new ArgumentException("angle DatumPlane reference must be a planar Face or DatumPlane", "reference");
+        if (axisLine == null) throw new ArgumentNullException("axisLine");
+
+        string stage = "CreateDatumPlaneBuilder";
+        DatumPlaneBuilder builder = null;
+        try
+        {
+            builder = part.Features.CreateDatumPlaneBuilder(null);
+            stage = "GetPlane";
+            Plane plane = builder.GetPlane();
+            if (plane == null) throw new InvalidOperationException("DatumPlaneBuilder returned no defining Plane.");
+            stage = "SetMethod(Angle)";
+            plane.SetMethod(PlaneTypes.MethodType.Angle);
+            stage = "SetGeometry";
+            plane.SetGeometry(new NXObject[] { reference, axisLine });
+            stage = "SetExpression";
+            // NX's native positive angle rotates opposite the public right-hand convention.
+            string expression = (-rightHandAngleDeg).ToString("R", CultureInfo.InvariantCulture);
+            plane.SetExpression(expression);
+            stage = "SetAlternate(One)";
+            plane.SetAlternate(PlaneTypes.AlternateType.One);
+            stage = "Evaluate";
+            plane.Evaluate();
+            stage = "CommitFeature";
+            return builder.CommitFeature();
+        }
+        catch (Exception ex)
+        {
+            throw new InvalidOperationException("NX angle DatumPlane failed at " + stage + ": " +
+                ex.GetType().Name + ": " + ex.Message, ex);
+        }
+        finally
+        {
+            if (builder != null) try { builder.Destroy(); } catch { }
+        }
+    }
+
+    /// <summary>Creates a native associative TwoLines DatumPlane using NX's verified Three alternate.</summary>
+    public static Feature CreateTwoLineDatumPlane(Part part, Line line1, Line line2)
+    {
+        RequirePart(part);
+        if (line1 == null) throw new ArgumentNullException("line1");
+        if (line2 == null) throw new ArgumentNullException("line2");
+        if (line1.Tag.Equals(line2.Tag))
+            throw new ArgumentException("two-line DatumPlane requires two distinct native NX Lines");
+
+        string stage = "CreateDatumPlaneBuilder";
+        DatumPlaneBuilder builder = null;
+        try
+        {
+            builder = part.Features.CreateDatumPlaneBuilder(null);
+            stage = "GetPlane";
+            Plane plane = builder.GetPlane();
+            if (plane == null) throw new InvalidOperationException("DatumPlaneBuilder returned no defining Plane.");
+            stage = "SetMethod(TwoLines)";
+            plane.SetMethod(PlaneTypes.MethodType.TwoLines);
+            stage = "SetGeometry";
+            plane.SetGeometry(new NXObject[] { line1, line2 });
+            stage = "SetAlternate(Three)";
+            plane.SetAlternate(PlaneTypes.AlternateType.Three);
+            stage = "Evaluate";
+            plane.Evaluate();
+            stage = "CommitFeature";
+            return builder.CommitFeature();
+        }
+        catch (Exception ex)
+        {
+            throw new InvalidOperationException("NX two-line DatumPlane failed at " + stage + ": " +
+                ex.GetType().Name + ": " + ex.Message, ex);
+        }
+        finally
+        {
+            if (builder != null) try { builder.Destroy(); } catch { }
         }
     }
 
@@ -122,27 +298,34 @@ public static class M3NxFeatureFactory
         if (xLength <= AxisTolerance) throw new ArgumentException("face reference axis must not be parallel to its normal");
         xAxis = new Vector3d(xAxis.X / xLength, xAxis.Y / xLength, xAxis.Z / xLength);
 
+        NormalizeFrame(ref normal, ref xAxis);
         supportPlane = part.Planes.CreatePlane(PlaneTypes.MethodType.Coincident,
             PlaneTypes.AlternateType.One, origin, normal, null, false, false, new NXObject[] { face });
-        Direction axisReference = part.Directions.CreateDirection(origin, xAxis, SmartObject.UpdateOption.WithinModeling);
-        Point sketchOrigin = part.Points.CreatePoint(origin);
-        SketchInPlaceBuilder builder = part.Sketches.CreateSketchInPlaceBuilder2(null);
-        try
-        {
-            builder.PlaneReference = supportPlane;
-            builder.AxisReference = axisReference;
-            builder.SketchOrigin = sketchOrigin;
-            builder.PlaneOption = Sketch.PlaneOption.ExistingPlane;
-            builder.OriginOption = OriginMethod.SpecifyPoint;
-            Sketch sketch = (Sketch)builder.Commit();
-            sketch.Activate(Sketch.ViewReorient.False);
-            return sketch;
-        }
-        finally
-        {
-            builder.Destroy();
-        }
+        return CreateSketchOnPlane(part, supportPlane, origin, normal, xAxis);
     }
+
+    private static void NormalizeFrame(ref Vector3d normal, ref Vector3d xAxis)
+    {
+        double normalLength = Math.Sqrt(normal.X * normal.X + normal.Y * normal.Y + normal.Z * normal.Z);
+        if (normalLength <= AxisTolerance || Double.IsNaN(normalLength) || Double.IsInfinity(normalLength))
+            throw new ArgumentException("plane normal must be finite and nonzero");
+        normal = new Vector3d(normal.X / normalLength, normal.Y / normalLength, normal.Z / normalLength);
+        double projection = xAxis.X * normal.X + xAxis.Y * normal.Y + xAxis.Z * normal.Z;
+        xAxis = new Vector3d(xAxis.X - projection * normal.X, xAxis.Y - projection * normal.Y,
+            xAxis.Z - projection * normal.Z);
+        double xLength = Math.Sqrt(xAxis.X * xAxis.X + xAxis.Y * xAxis.Y + xAxis.Z * xAxis.Z);
+        if (xLength <= AxisTolerance || Double.IsNaN(xLength) || Double.IsInfinity(xLength))
+            throw new ArgumentException("plane x direction must be finite and not parallel to its normal");
+        xAxis = new Vector3d(xAxis.X / xLength, xAxis.Y / xLength, xAxis.Z / xLength);
+    }
+
+    private static Vector3d Cross(Vector3d left, Vector3d right)
+    {
+        return new Vector3d(left.Y * right.Z - left.Z * right.Y,
+            left.Z * right.X - left.X * right.Z,
+            left.X * right.Y - left.Y * right.X);
+    }
+
 
     /// <summary>
     /// Creates a line in sketch-local coordinates. Axis-aligned lines use one
@@ -321,59 +504,156 @@ public static class M3NxFeatureFactory
         return new M3CircleResult { Geometry = circle, DrivingDimensions = dimensions.ToArray() };
     }
 
+    /// <summary>Creates a native line without adding driving or inferred Sketch constraints.</summary>
+    public static M3LineResult CreateLineGeometry(Part part, Sketch sketch,
+        double x1, double y1, double x2, double y2)
+    {
+        RequireSketch(part, sketch);
+        RequireFinite(x1, "x1"); RequireFinite(y1, "y1");
+        RequireFinite(x2, "x2"); RequireFinite(y2, "y2");
+        if (Math.Abs(x2 - x1) <= AxisTolerance && Math.Abs(y2 - y1) <= AxisTolerance)
+            throw new ArgumentException("A line must have nonzero length.");
+        SketchFrame frame = GetSketchFrame(sketch);
+        Line line = part.Curves.CreateLine(ToModelPoint(frame, x1, y1), ToModelPoint(frame, x2, y2));
+        sketch.AddGeometry(line, Sketch.InferConstraintsOption.InferNoConstraints);
+        return new M3LineResult { Geometry = line, DrivingDimensions = new SketchDimensionalConstraint[0] };
+    }
+
+    /// <summary>Creates four native rectangle lines without adding Sketch constraints.</summary>
+    public static M3RectangleResult CreateRectangleGeometry(Part part, Sketch sketch,
+        double x, double y, double width, double height)
+    {
+        RequireSketch(part, sketch);
+        RequireFinite(x, "x"); RequireFinite(y, "y");
+        RequirePositiveFinite(width, "width"); RequirePositiveFinite(height, "height");
+        double right = x + width;
+        double top = y + height;
+        RequireFinite(right, "x+width"); RequireFinite(top, "y+height");
+        SketchFrame frame = GetSketchFrame(sketch);
+        Line[] lines = new Line[] {
+            part.Curves.CreateLine(ToModelPoint(frame, x, y), ToModelPoint(frame, right, y)),
+            part.Curves.CreateLine(ToModelPoint(frame, right, y), ToModelPoint(frame, right, top)),
+            part.Curves.CreateLine(ToModelPoint(frame, right, top), ToModelPoint(frame, x, top)),
+            part.Curves.CreateLine(ToModelPoint(frame, x, top), ToModelPoint(frame, x, y))
+        };
+        for (int i = 0; i < lines.Length; i++)
+            sketch.AddGeometry(lines[i], Sketch.InferConstraintsOption.InferNoConstraints);
+        return new M3RectangleResult { Geometry = lines, DrivingDimensions = new SketchDimensionalConstraint[0] };
+    }
+
+    /// <summary>Creates a native full-circle Arc without adding Sketch constraints.</summary>
+    public static M3CircleResult CreateCircleGeometry(Part part, Sketch sketch,
+        double centerX, double centerY, double diameter)
+    {
+        RequireSketch(part, sketch);
+        RequireFinite(centerX, "centerX"); RequireFinite(centerY, "centerY");
+        RequirePositiveFinite(diameter, "diameter");
+        SketchFrame frame = GetSketchFrame(sketch);
+        Arc circle = part.Curves.CreateArc(ToModelPoint(frame, centerX, centerY), frame.XAxis, frame.YAxis,
+            diameter / 2.0, 0.0, 2.0 * Pi);
+        sketch.AddGeometry(circle, Sketch.InferConstraintsOption.InferNoConstraints);
+        return new M3CircleResult { Geometry = circle, DrivingDimensions = new SketchDimensionalConstraint[0] };
+    }
+
     /// <summary>
-    /// Extrudes one closed profile found in the Sketch. For Unite/Subtract,
-    /// targetBody is required and is passed explicitly to NX SetTargetBodies.
-    /// sectionHelpX/Y are sketch-local section help coordinates.
+    /// Extrudes the validated non-reference whole-sketch Section. Boolean
+    /// operations always target the one explicitly selected solid body.
     /// </summary>
+    /// <remarks>Compatibility overload for existing C# callers; help coordinates no longer select a region.</remarks>
     public static Feature CreateExtrude(Part part, Sketch sketch, double sectionHelpX, double sectionHelpY,
         M3ExtrudeExtent extent, double finiteDistance,
         M3ExtrudeDirection direction, M3BooleanMode booleanMode, Body targetBody)
     {
+        RequireFinite(sectionHelpX, "sectionHelpX");
+        RequireFinite(sectionHelpY, "sectionHelpY");
+        if (extent == M3ExtrudeExtent.Finite) RequirePositiveFinite(finiteDistance, "finiteDistance");
+        Dictionary<string, object> profile = V2SketchProfileAnalyzer.AnalyzeF12WholeSketchSection(part, sketch);
+        string inputFingerprint = Convert.ToString(profile["input_geometry_domain_fingerprint"], CultureInfo.InvariantCulture);
+        Dictionary<string, object> sectionEvidence;
+        return CreateExtrude(part, sketch, inputFingerprint, "solid", extent, 0.0,
+            extent == M3ExtrudeExtent.Finite ? finiteDistance : 0.0, direction,
+            booleanMode, targetBody, out sectionEvidence);
+    }
+
+    public static Feature CreateExtrude(Part part, Sketch sketch, string expectedInputDomainFingerprint,
+        string profileOutput, M3ExtrudeExtent extent, double startOffsetMm, double endOffsetMm,
+        M3ExtrudeDirection direction, M3BooleanMode booleanMode, Body targetBody,
+        out Dictionary<string, object> sectionEvidence)
+    {
         RequirePart(part);
         if (sketch == null) throw new ArgumentNullException("sketch");
-        RequireFinite(sectionHelpX, "sectionHelpX"); RequireFinite(sectionHelpY, "sectionHelpY");
         if (sketch.Feature == null) throw new ArgumentException("Sketch has no associated feature.", "sketch");
-        Curve[] profileCurves = GetSingleClosedProfile(sketch);
-        SketchFrame frame = GetSketchFrame(sketch);
-        Point3d sectionHelpPoint = ToModelPoint(frame, sectionHelpX, sectionHelpY);
-
-        if (extent == M3ExtrudeExtent.Finite) RequirePositiveFinite(finiteDistance, "finiteDistance");
-        else if (extent != M3ExtrudeExtent.ThroughAll) throw new ArgumentOutOfRangeException("extent");
+        RequireFinite(startOffsetMm, "startOffsetMm");
+        if (extent == M3ExtrudeExtent.Finite)
+        {
+            RequireFinite(endOffsetMm, "endOffsetMm");
+            double span = endOffsetMm - startOffsetMm;
+            RequirePositiveFinite(span, "finite extrusion span");
+        }
+        else if (extent != M3ExtrudeExtent.ThroughAll)
+            throw new ArgumentOutOfRangeException("extent");
+        if (profileOutput != "solid" && profileOutput != "sheet")
+            throw new ArgumentException("profileOutput must be solid or sheet.", "profileOutput");
+        if (profileOutput == "sheet" &&
+            (extent != M3ExtrudeExtent.Finite || booleanMode != M3BooleanMode.Create))
+            throw new ArgumentException("Sheet output is supported only for finite create extrusions.", "profileOutput");
         if (direction != M3ExtrudeDirection.Positive && direction != M3ExtrudeDirection.Negative)
             throw new ArgumentOutOfRangeException("direction");
         if (booleanMode != M3BooleanMode.Create && booleanMode != M3BooleanMode.Unite && booleanMode != M3BooleanMode.Subtract)
             throw new ArgumentOutOfRangeException("booleanMode");
-
         if (booleanMode == M3BooleanMode.Create)
         {
             if (targetBody != null) throw new ArgumentException("Create mode does not accept a target body.", "targetBody");
         }
         else
         {
+            if (profileOutput != "solid") throw new ArgumentException("Boolean extrusion requires solid output.", "profileOutput");
             RequireTargetBody(part, targetBody);
         }
 
+        Curve seed = GetFirstActiveCurve(sketch);
+        SketchFrame frame = GetSketchFrame(sketch);
+
         Section section = part.Sections.CreateSection(0.0095, 0.01, 0.5);
         CurveFeatureRule curveRule = part.ScRuleFactory.CreateRuleCurveFeature(new Feature[] { sketch.Feature });
-        section.AddToSection(new SelectionIntentRule[] { curveRule }, profileCurves[0], null, null,
-            sectionHelpPoint, Section.Mode.Create);
+        section.SetAllowedEntityTypes(Section.AllowTypes.OnlyCurves);
+        section.SetAllowRefCrvs(false);
+        section.AddToSection(new SelectionIntentRule[] { curveRule }, seed, null, null,
+            frame.Origin, Section.Mode.Create, true);
+
+        sectionEvidence = V2SketchProfileAnalyzer.AnalyzeF12SectionDomain(part, sketch, section);
+        if (!SectionDomainMatches(sectionEvidence, expectedInputDomainFingerprint))
+            throw new InvalidOperationException("NX Extrude Section does not exactly match the validated non-reference whole-sketch profile domain.");
 
         double sign = direction == M3ExtrudeDirection.Positive ? 1.0 : -1.0;
         Vector3d extrudeVector = new Vector3d(frame.Normal.X * sign, frame.Normal.Y * sign, frame.Normal.Z * sign);
         Direction extrudeDirection = part.Directions.CreateDirection(
-            new Point3d(0.0, 0.0, 0.0), extrudeVector, SmartObject.UpdateOption.WithinModeling);
+            frame.Origin, extrudeVector, SmartObject.UpdateOption.WithinModeling);
 
         ExtrudeBuilder builder = part.Features.CreateExtrudeBuilder(null);
         try
         {
             builder.Section = section;
             builder.Direction = extrudeDirection;
-            builder.Limits.StartExtend.Value.RightHandSide = "0";
+            builder.FeatureOptions.BodyType = profileOutput == "sheet"
+                ? NXOpen.GeometricUtilities.FeatureOptions.BodyStyle.Sheet
+                : NXOpen.GeometricUtilities.FeatureOptions.BodyStyle.Solid;
+            builder.Draft.DraftOption = NXOpen.GeometricUtilities.SimpleDraft.SimpleDraftType.NoDraft;
+            builder.Draft.DraftAngle.RightHandSide = "0";
+            builder.Draft.FrontDraftAngle.RightHandSide = "0";
+            builder.Draft.BackDraftAngle.RightHandSide = "0";
+            builder.Offset.Option = NXOpen.GeometricUtilities.Type.NoOffset;
+            builder.Offset.StartOffset.RightHandSide = "0";
+            builder.Offset.EndOffset.RightHandSide = "0";
+            builder.Limits.StartExtend.TrimType = NXOpen.GeometricUtilities.Extend.ExtendType.Value;
+            builder.Limits.StartExtend.Value.RightHandSide = NumberText(startOffsetMm);
             if (extent == M3ExtrudeExtent.ThroughAll)
                 builder.Limits.EndExtend.TrimType = NXOpen.GeometricUtilities.Extend.ExtendType.ThroughAll;
             else
-                builder.Limits.EndExtend.Value.RightHandSide = NumberText(finiteDistance);
+            {
+                builder.Limits.EndExtend.TrimType = NXOpen.GeometricUtilities.Extend.ExtendType.Value;
+                builder.Limits.EndExtend.Value.RightHandSide = NumberText(endOffsetMm);
+            }
 
             if (booleanMode == M3BooleanMode.Create)
                 builder.BooleanOperation.Type = NXOpen.GeometricUtilities.BooleanOperation.BooleanType.Create;
@@ -391,6 +671,49 @@ public static class M3NxFeatureFactory
         {
             builder.Destroy();
         }
+    }
+
+    private static Curve GetFirstActiveCurve(Sketch sketch)
+    {
+        NXObject[] geometry = sketch.GetAllGeometry();
+        if (geometry == null) throw new InvalidOperationException("Sketch.GetAllGeometry returned null.");
+        UFSession uf = UFSession.GetUFSession();
+        if (uf == null) throw new InvalidOperationException("UF session is unavailable for sketch reference-state readback.");
+        Curve first = null;
+        foreach (NXObject item in geometry)
+        {
+            if (item == null) throw new InvalidOperationException("Sketch geometry contains null.");
+            Curve curve = item as Curve;
+            if (curve == null) throw new InvalidOperationException("Extrude source Sketch contains non-curve geometry.");
+            UFSket.ReferenceStatus status;
+            uf.Sket.AskReferenceStatus(sketch.Tag, curve.Tag, out status);
+            if (status == UFSket.ReferenceStatus.Reference) continue;
+            if (status != UFSket.ReferenceStatus.Active)
+                throw new InvalidOperationException("Extrude source curve has an unclassified NX reference state.");
+            if (!(curve is Line) && !(curve is Arc) && !(curve is Ellipse) && !(curve is Spline))
+                throw new InvalidOperationException("Extrude source Sketch contains an unsupported curve type.");
+            if (first == null) first = curve;
+        }
+        if (first == null) throw new InvalidOperationException("Extrude source Sketch contains no active non-reference curves.");
+        return first;
+    }
+
+    private static bool SectionDomainMatches(Dictionary<string, object> sectionEvidence,
+        string expectedInputDomainFingerprint)
+    {
+        if (sectionEvidence == null || String.IsNullOrEmpty(expectedInputDomainFingerprint)) return false;
+        object statusValue, matchValue, inputFingerprintValue;
+        Dictionary<string, object> matchRecord = null;
+        if (sectionEvidence.TryGetValue("section_domain_match", out matchValue))
+            matchRecord = matchValue as Dictionary<string, object>;
+        object matchStatus = null;
+        if (matchRecord != null) matchRecord.TryGetValue("status", out matchStatus);
+        return sectionEvidence.TryGetValue("status", out statusValue) &&
+            String.Equals(Convert.ToString(statusValue, CultureInfo.InvariantCulture), "VERIFIED", StringComparison.Ordinal) &&
+            matchRecord != null && String.Equals(Convert.ToString(matchStatus, CultureInfo.InvariantCulture), "MATCHED", StringComparison.Ordinal) &&
+            sectionEvidence.TryGetValue("input_geometry_domain_fingerprint", out inputFingerprintValue) &&
+            String.Equals(Convert.ToString(inputFingerprintValue, CultureInfo.InvariantCulture),
+                expectedInputDomainFingerprint, StringComparison.Ordinal);
     }
 
     private static SketchDimensionalConstraint CreateSpanDimension(Part part, Sketch sketch, Line line,
@@ -539,104 +862,6 @@ public static class M3NxFeatureFactory
             YAxis = new Vector3d(axes.Yx, axes.Yy, axes.Yz),
             Normal = new Vector3d(axes.Zx, axes.Zy, axes.Zz)
         };
-    }
-
-    private static Curve[] GetSingleClosedProfile(Sketch sketch)
-    {
-        NXObject[] geometry = sketch.GetAllGeometry();
-        if (geometry == null || geometry.Length == 0)
-            throw new ArgumentException("Sketch has no geometry to extrude.", "sketch");
-
-        List<Curve> curves = new List<Curve>();
-        List<Line> lines = new List<Line>();
-        List<Arc> arcs = new List<Arc>();
-        foreach (NXObject item in geometry)
-        {
-            if (item == null) throw new ArgumentException("Sketch geometry contains null.", "sketch");
-            Curve curve = item as Curve;
-            if (curve == null)
-                throw new ArgumentException("Extrude supports only line and full-circle sketch profiles.", "sketch");
-            curves.Add(curve);
-            Line line = item as Line;
-            Arc arc = item as Arc;
-            if (line != null) lines.Add(line);
-            else if (arc != null) arcs.Add(arc);
-            else throw new ArgumentException("Extrude supports only line and full-circle sketch profiles.", "sketch");
-        }
-
-        if (arcs.Count == 1 && lines.Count == 0 && curves.Count == 1)
-        {
-            double sweep = arcs[0].EndAngle - arcs[0].StartAngle;
-            if (Math.Abs(Math.Abs(sweep) - 2.0 * Pi) <= 1e-7) return curves.ToArray();
-            throw new ArgumentException("Arc extrudes require one complete 0-to-2π circle.", "sketch");
-        }
-        if (arcs.Count != 0 || lines.Count < 3)
-            throw new ArgumentException("Extrude requires one closed loop of lines or one full circle.", "sketch");
-
-        RequireSingleLineLoop(lines);
-        return curves.ToArray();
-    }
-
-    private static void RequireSingleLineLoop(List<Line> lines)
-    {
-        List<Point3d> vertices = new List<Point3d>();
-        int[] starts = new int[lines.Count];
-        int[] ends = new int[lines.Count];
-        for (int i = 0; i < lines.Count; i++)
-        {
-            Point3d start = lines[i].StartPoint;
-            Point3d end = lines[i].EndPoint;
-            if (Distance(start, end) <= PointTolerance)
-                throw new ArgumentException("Extrude profile contains a zero-length line.", "sketch");
-            starts[i] = FindOrAddVertex(vertices, start);
-            ends[i] = FindOrAddVertex(vertices, end);
-        }
-
-        int[] degrees = new int[vertices.Count];
-        for (int i = 0; i < lines.Count; i++)
-        {
-            degrees[starts[i]]++;
-            degrees[ends[i]]++;
-        }
-        for (int i = 0; i < degrees.Length; i++)
-            if (degrees[i] != 2)
-                throw new ArgumentException("Extrude line profile is open or branches at a vertex.", "sketch");
-
-        bool[] visited = new bool[vertices.Count];
-        List<int> pending = new List<int>();
-        pending.Add(0);
-        visited[0] = true;
-        for (int at = 0; at < pending.Count; at++)
-        {
-            int vertex = pending[at];
-            for (int edge = 0; edge < lines.Count; edge++)
-            {
-                int adjacent = starts[edge] == vertex ? ends[edge] : (ends[edge] == vertex ? starts[edge] : -1);
-                if (adjacent >= 0 && !visited[adjacent])
-                {
-                    visited[adjacent] = true;
-                    pending.Add(adjacent);
-                }
-            }
-        }
-        for (int i = 0; i < visited.Length; i++)
-            if (!visited[i]) throw new ArgumentException("Extrude supports exactly one connected profile loop.", "sketch");
-    }
-
-    private static int FindOrAddVertex(List<Point3d> vertices, Point3d point)
-    {
-        for (int i = 0; i < vertices.Count; i++)
-            if (Distance(vertices[i], point) <= PointTolerance) return i;
-        vertices.Add(point);
-        return vertices.Count - 1;
-    }
-
-    private static double Distance(Point3d left, Point3d right)
-    {
-        double x = left.X - right.X;
-        double y = left.Y - right.Y;
-        double z = left.Z - right.Z;
-        return Math.Sqrt(x * x + y * y + z * z);
     }
 
     private static Point3d ToModelPoint(SketchFrame frame, double x, double y)

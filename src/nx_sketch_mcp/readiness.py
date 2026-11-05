@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -83,8 +82,8 @@ class NxReadiness:
             return {"state": "NEEDS_MANUAL_ACTION", "ready": False, "code": "UNSUPPORTED_PLATFORM",
                     "message": "Automatic NX GUI connection preparation requires Windows."}
         assert self._config.token_file is not None
-        identity = hashlib.sha256((str(self._config.pipe_name).casefold() + "\0" +
-                                   os.path.normcase(str(self._config.token_file))).encode()).hexdigest()[:24]
+        assert self._config.pipe_name is not None
+        identity = self._config.pipe_name.casefold()
         private_dir = self._config.token_file.parent
         if not private_dir.is_dir():
             return {"state": "NEEDS_MANUAL_ACTION", "ready": False, "code": "SESSION_DIRECTORY_MISSING",

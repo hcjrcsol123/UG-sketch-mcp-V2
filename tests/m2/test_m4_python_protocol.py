@@ -79,6 +79,85 @@ class M4PythonProtocolTests(unittest.TestCase):
             "selector": selector, "body_id": "body-2",
         })
 
+    def test_all_planar_face_discovery_selector_is_forwarded_unchanged(self):
+        backend_result = {
+            "selection_status": "all", "selector_normalized": {"canonical": "all_planar"},
+            "candidate_count": 2, "candidates": [
+                {"face_journal_id": "FACE 4"}, {"face_journal_id": "FACE 9"},
+            ], "clarification_required": False, "revision_id": "rev-8",
+        }
+        self.bridge_call.return_value = backend_result
+        response = self.server._tools_call(10, {"name": "nx_query_faces", "arguments": {
+            "ownership_id": "owner-1", "binding_epoch": 7, "revision_id": "rev-8", "selector": "all_planar",
+        }})
+        self.assertIs(response["result"]["isError"], False, response)
+        self.assertIs(response["result"]["structuredContent"], backend_result)
+        self.bridge_call.assert_called_once_with("model.query_faces", {
+            "ownership_id": "owner-1", "binding_epoch": 7, "revision_id": "rev-8", "selector": "all_planar",
+        })
+
+    def test_prepare_datum_plane_schema_and_route(self):
+        tool = self.tool("nx_prepare_datum_plane")
+        self.assertEqual(tool["inputSchema"]["required"], [
+            "operation_id", "ownership_id", "binding_epoch", "revision_id",
+        ])
+        self.assertIn("origin_mm", tool["inputSchema"]["properties"])
+        self.assertIn("distance_mm", tool["inputSchema"]["properties"])
+        self.assertIs(tool["inputSchema"]["additionalProperties"], False)
+        self.assertIs(tool["annotations"]["readOnlyHint"], True)
+        arguments = {
+            "operation_id": "f02-datum-1", "ownership_id": "owner-1", "binding_epoch": 7,
+            "revision_id": "rev-8", "origin_mm": [10, 20, 30], "normal": [1, 2, 3],
+            "x_axis": [1, 0, 0],
+        }
+        response = self.server._tools_call(11, {"name": "nx_prepare_datum_plane", "arguments": arguments})
+        self.assertIs(response["result"]["isError"], False, response)
+        self.bridge_call.assert_called_once_with("operation.prepare_datum_plane", arguments)
+
+    def test_prepare_datum_plane_rejects_incomplete_and_extra_arguments(self):
+        base = {
+            "operation_id": "f02-datum-1", "ownership_id": "owner-1", "binding_epoch": 7,
+            "revision_id": "rev-8", "origin_mm": [0, 0, 0], "normal": [0, 0, 1], "x_axis": [1, 0, 0],
+        }
+        for arguments in (
+            {key: value for key, value in base.items() if key != "normal"},
+            {**base, "unexpected": True},
+        ):
+            with self.subTest(arguments=arguments):
+                self.assert_tool_input_error("nx_prepare_datum_plane", arguments)
+
+    def test_empty_sketch_accepts_omitted_and_empty_geometries(self):
+        base = {
+            "operation_id": "f01-empty-1", "ownership_id": "owner-1", "binding_epoch": 7,
+            "revision_id": "rev-8", "plane": "XY", "origin_mm": [0, 0, 0],
+        }
+        for call_id, arguments in ((12, base), (13, {**base, "geometries": []})):
+            with self.subTest(arguments=arguments):
+                self.bridge_call.reset_mock()
+                response = self.server._tools_call(call_id, {"name": "nx_prepare_sketch", "arguments": arguments})
+                self.assertIs(response["result"]["isError"], False, response)
+                expected = {**base, "geometries": []}
+                self.bridge_call.assert_called_once_with("operation.prepare_sketch", expected)
+
+    def test_custom_and_support_sketch_frames_route_without_redundant_normal(self):
+        common = self.common_sketch_args()
+        cases = [
+            ({**common, "origin_mm": [1, 2, 3], "normal": [1, 1, 1], "x_axis": [1, 0, 0]},
+             {**common, "origin_mm": [1, 2, 3], "normal": [1, 1, 1], "x_axis": [1, 0, 0]}),
+            ({**common, "support_face_id": "FACE 4", "origin_mm": [1, 2, 3], "x_axis": [1, 0, 0]},
+             {**common, "support_face_id": "FACE 4", "origin_mm": [1, 2, 3], "x_axis": [1, 0, 0]}),
+            ({**common, "support_datum_plane_id": "DATUM_PLANE(1)", "x_axis": [1, 0, 0]},
+             {**common, "support_datum_plane_id": "DATUM_PLANE(1)", "x_axis": [1, 0, 0]}),
+            ({**common, "support_datum_plane_id": "DATUM_PLANE(1)", "origin_mm": [1, 2, 3], "x_axis": [1, 0, 0]},
+             {**common, "support_datum_plane_id": "DATUM_PLANE(1)", "origin_mm": [1, 2, 3], "x_axis": [1, 0, 0]}),
+        ]
+        for call_id, (arguments, expected) in enumerate(cases, start=14):
+            with self.subTest(arguments=arguments):
+                self.bridge_call.reset_mock()
+                response = self.server._tools_call(call_id, {"name": "nx_prepare_sketch", "arguments": arguments})
+                self.assertIs(response["result"]["isError"], False, response)
+                self.bridge_call.assert_called_once_with("operation.prepare_sketch", expected)
+
     def test_query_faces_rejects_missing_extra_and_empty_selector(self):
         base = {"ownership_id": "owner-1", "binding_epoch": 7, "revision_id": "rev-8", "selector": "top face"}
         for arguments in (
@@ -157,6 +236,13 @@ class M4PythonProtocolTests(unittest.TestCase):
         self.addCleanup(bridge.close)
         with self.assertRaises(BridgeFailure) as raised:
             bridge.call("model.query_faces", {})
+        self.assertEqual(raised.exception.code, "BRIDGE_UNCONFIGURED")
+
+    def test_bridge_accepts_datum_plane_prepare_as_supported_command(self):
+        bridge = JsonlBridge(config_from_object({}))
+        self.addCleanup(bridge.close)
+        with self.assertRaises(BridgeFailure) as raised:
+            bridge.call("operation.prepare_datum_plane", {})
         self.assertEqual(raised.exception.code, "BRIDGE_UNCONFIGURED")
 
 

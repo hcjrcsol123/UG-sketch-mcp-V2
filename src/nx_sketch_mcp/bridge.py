@@ -11,6 +11,7 @@ from typing import Any, BinaryIO
 
 from .config import BridgeConfig
 from .jsonutil import dumps_line, loads_unique
+from . import journal
 
 
 _MAX_LINE_BYTES = 8_388_608
@@ -27,7 +28,27 @@ _SUPPORTED_COMMANDS = {
     "operation.cancel",
     "operation.prepare",
     "operation.prepare_sketch",
+    "operation.prepare_sketch_corner",
+    "operation.edit_sketch_corner",
+    "operation.prepare_sketch_offset",
+    "operation.edit_sketch_offset",
+    "operation.prepare_sketch_pattern",
+    "operation.edit_sketch_pattern",
+    "operation.prepare_sketch_projection",
+    "operation.edit_sketch_projection",
+    "operation.prepare_sketch_reference_conversion",
+    "operation.edit_sketch_reference_conversion",
+    "operation.prepare_datum_plane",
     "operation.prepare_extrude",
+    "operation.prepare_revolve",
+    "operation.prepare_sweep",
+    "operation.prepare_boolean",
+    "operation.prepare_chamfer",
+    "operation.prepare_feature_pattern",
+    "operation.prepare_feature_mirror",
+    "operation.prepare_spatial_curve",
+    "operation.prepare_edge_blend",
+    "operation.prepare_hole",
     "operation.prepare_thread",
     "operation.prepare_helical_groove",
     "operation.execute_plan",
@@ -59,6 +80,22 @@ class JsonlBridge:
         self._closed = False
 
     def call(self, command: str, params: dict[str, Any], *, timeout_seconds: float | None = None) -> dict[str, Any]:
+        # A Journal owns this same cross-process gate for its whole batch. This
+        # covers manual bridge connections as well as managed GUI launches.
+        try:
+            root = journal._root()
+            root.mkdir(parents=True, exist_ok=True)
+            kernel, handle = journal._gate(root)
+        except (OSError, ValueError) as exc:
+            raise BridgeFailure("JOURNAL_COORDINATION_BUSY", "Journal coordination is unavailable; no bridge call was dispatched.") from exc
+        try:
+            if (root / "active.json").exists():
+                raise BridgeFailure("JOURNAL_OUTCOME_UNRESOLVED", "A Journal activity marker blocks bridge calls; inspect it before manual recovery.")
+            return self._call_locked(command, params, timeout_seconds=timeout_seconds)
+        finally:
+            kernel.CloseHandle(handle)
+
+    def _call_locked(self, command: str, params: dict[str, Any], *, timeout_seconds: float | None = None) -> dict[str, Any]:
         if command not in _SUPPORTED_COMMANDS:
             raise ValueError("unsupported bridge command")
         if not self._config.configured:
@@ -92,18 +129,18 @@ class JsonlBridge:
                 error = response["error"]
                 if not isinstance(error, dict):
                     self._fail_process(process)
-                    raise BridgeFailure("BRIDGE_PROTOCOL_ERROR", "The bridge returned an invalid error response.")
+                    raise BridgeFailure("BRIDGE_PROTOCOL_ERROR", "The bridge returned an invalid error response.", outcome_unknown=True)
                 code = error.get("code")
                 message = error.get("message")
                 if not isinstance(code, str) or not code or not isinstance(message, str) or not message:
                     self._fail_process(process)
-                    raise BridgeFailure("BRIDGE_PROTOCOL_ERROR", "The bridge returned an invalid error response.")
+                    raise BridgeFailure("BRIDGE_PROTOCOL_ERROR", "The bridge returned an invalid error response.", outcome_unknown=True)
                 raise BridgeFailure(code, message)
 
             result = response["result"]
             if not isinstance(result, dict):
                 self._fail_process(process)
-                raise BridgeFailure("BRIDGE_PROTOCOL_ERROR", "The bridge returned an invalid result.")
+                raise BridgeFailure("BRIDGE_PROTOCOL_ERROR", "The bridge returned an invalid result.", outcome_unknown=True)
             return result
 
     def _ensure_process(self) -> tuple[subprocess.Popen[bytes], queue.Queue[object]]:
@@ -181,7 +218,7 @@ class JsonlBridge:
             process.stdin.flush()
         except (BrokenPipeError, OSError) as exc:
             self._fail_process(process)
-            raise BridgeFailure("BRIDGE_UNAVAILABLE", "The local bridge helper stopped accepting requests.") from exc
+            raise BridgeFailure("BRIDGE_UNAVAILABLE", "The local bridge helper stopped accepting requests.", outcome_unknown=True) from exc
 
     def _read_response(
         self,

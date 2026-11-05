@@ -62,8 +62,8 @@ class M3BridgeSubsystemTests(unittest.TestCase):
         return successful_helper_result(self, self.helper_call(helper, "ownership.takeover", args))
 
     def prepare_sketch_args(self, operation_id, owner, epoch, revision_id, geometries,
-                            *, plane="XY", origin_mm=(0.0, 0.0, 0.0)):
-        return {
+                            *, plane="XY", origin_mm=(0.0, 0.0, 0.0), constraint_mode=None):
+        arguments = {
             "operation_id": operation_id,
             "ownership_id": owner,
             "binding_epoch": epoch,
@@ -72,9 +72,13 @@ class M3BridgeSubsystemTests(unittest.TestCase):
             "origin_mm": list(origin_mm),
             "geometries": geometries,
         }
+        if constraint_mode is not None:
+            arguments["constraint_mode"] = constraint_mode
+        return arguments
 
     def prepare_extrude_args(self, operation_id, owner, epoch, revision_id, sketch_id,
-                             *, mode, direction, extent, depth_mm=None, target_body_id=None):
+                             *, mode, direction, extent, depth_mm=None, target_body_id=None,
+                             profile_output=None, start_offset_mm=None, end_offset_mm=None):
         args = {
             "operation_id": operation_id,
             "ownership_id": owner,
@@ -89,6 +93,12 @@ class M3BridgeSubsystemTests(unittest.TestCase):
             args["depth_mm"] = depth_mm
         if target_body_id is not None:
             args["target_body_id"] = target_body_id
+        if profile_output is not None:
+            args["profile_output"] = profile_output
+        if start_offset_mm is not None:
+            args["start_offset_mm"] = start_offset_mm
+        if end_offset_mm is not None:
+            args["end_offset_mm"] = end_offset_mm
         return args
 
     def create_sketch(self, helper, owner, epoch, geometries, *, plane="XY", origin_mm=(0, 0, 0)):
@@ -113,7 +123,8 @@ class M3BridgeSubsystemTests(unittest.TestCase):
         return completed
 
     def prepare_extrude(self, helper, owner, epoch, sketch_id, *, mode, direction, extent,
-                        depth_mm=None, target_body_id=None, operation_id=None):
+                        depth_mm=None, target_body_id=None, operation_id=None,
+                        profile_output=None, start_offset_mm=None, end_offset_mm=None):
         session = successful_helper_result(self, self.helper_call(helper, "model.get_session", {
             "ownership_id": owner, "binding_epoch": epoch,
         }))
@@ -122,6 +133,7 @@ class M3BridgeSubsystemTests(unittest.TestCase):
             owner, epoch, session["revision_id"], sketch_id,
             mode=mode, direction=direction, extent=extent,
             depth_mm=depth_mm, target_body_id=target_body_id,
+            profile_output=profile_output, start_offset_mm=start_offset_mm, end_offset_mm=end_offset_mm,
         )
         return session, args, successful_helper_result(self, self.helper_call(helper, "operation.prepare_extrude", args))
 
@@ -151,6 +163,53 @@ class M3BridgeSubsystemTests(unittest.TestCase):
         self.assertEqual(completed.get("result", {}).get("execute_operation_id"), execute_operation_id, completed)
         return completed
 
+    def test_geometry_only_line_profile_has_no_dimensions_and_verifies_underconstrained(self):
+        ready = self.start_harness()
+        helper = self.start_helper()
+        host, _ = self.start_host(timeout_seconds=10.0)
+        grant = self.takeover(ready, helper=helper)
+        owner, epoch = grant["ownership_id"], grant["binding_epoch"]
+        session = successful_helper_result(self, self.helper_call(helper, "model.get_session", {
+            "ownership_id": owner, "binding_epoch": epoch,
+        }))
+        points = [(0.0, 0.0), (20.0, 0.0), (20.0, 5.0), (8.0, 5.0), (8.0, 20.0), (0.0, 20.0), (0.0, 0.0)]
+        geometries = [{
+            "id": "geometry-only-edge-" + str(index),
+            "type": "line",
+            "start_mm": list(points[index]),
+            "end_mm": list(points[index + 1]),
+        } for index in range(len(points) - 1)]
+        prepared = successful_helper_result(self, self.helper_call(helper, "operation.prepare_sketch",
+            self.prepare_sketch_args("geometry-only-prepare-" + uuid.uuid4().hex, owner, epoch,
+                session["revision_id"], geometries, constraint_mode="geometry_only")))
+        plan = prepared.get("result", {}).get("plan", {})
+        self.assertEqual(plan.get("constraint_mode"), "geometry_only", plan)
+        self.assertEqual(plan.get("driving_dimensions"), [], plan)
+
+        execute_id, _, executed = self.execute_plan(helper, owner, epoch, plan["plan_id"])
+        self.assertEqual(executed.get("state"), "SUCCEEDED", executed)
+        result = executed.get("result", {})
+        self.assertEqual(result.get("constraint_mode"), "geometry_only", executed)
+        self.assertEqual(result.get("sketch_status"), "UnderConstrained", executed)
+        self.assertGreater(result.get("degrees_of_freedom", 0), 0, executed)
+        self.assertEqual(result.get("constraint_ids"), [], executed)
+        self.assertEqual(result.get("driving_dimensions"), [], executed)
+        counts = self.fake_counts()
+        self.assertEqual(counts.get("m3_constraint_count"), 0, counts)
+
+        verified = self.verify_plan(helper, host, owner, epoch, execute_id)
+        self.assertIs(verified.get("result", {}).get("verified"), True, verified)
+        self.assertEqual(verified.get("result", {}).get("checks", {}).get("constraints", {}).get("status"),
+                         "VERIFIED", verified)
+        record("M3-geometry-only-line-profile", {
+            "constraint_mode": result["constraint_mode"],
+            "native_line_count": len(geometries),
+            "sketch_status": result["sketch_status"],
+            "degrees_of_freedom": result["degrees_of_freedom"],
+            "native_constraint_count": counts["m3_constraint_count"],
+            "verified": verified["result"]["verified"],
+        })
+
     def test_native_sketch_plan_execute_verify_and_driving_dimension_edit(self):
         ready = self.start_harness()
         helper = self.start_helper()
@@ -175,6 +234,7 @@ class M3BridgeSubsystemTests(unittest.TestCase):
         self.assertEqual(prepared.get("state"), "SUCCEEDED", prepared)
         plan = prepared.get("result", {}).get("plan", {})
         self.assertEqual(plan.get("kind"), "create_sketch", plan)
+        self.assertNotIn("constraint_mode", plan)
         self.assertEqual(plan.get("plane"), "XY", plan)
         self.assertEqual(plan.get("origin_mm"), [0.0, 0.0, 0.0], plan)
         self.assertEqual([item.get("type") for item in plan.get("geometries", [])],
@@ -512,6 +572,234 @@ class M3BridgeSubsystemTests(unittest.TestCase):
             "verified_checks": sorted(subtract_checks),
         })
 
+    def test_f12_legacy_depth_and_offsets_share_normalized_operation_key(self):
+        ready = self.start_harness()
+        helper = self.start_helper()
+        host, _ = self.start_host(timeout_seconds=10.0)
+        grant = self.takeover(ready, host=host)
+        owner, epoch = grant["ownership_id"], grant["binding_epoch"]
+        sketch = self.create_sketch(helper, owner, epoch, [{
+            "id": "f12-normalize-profile", "type": "rectangle", "corner_mm": [0, 0],
+            "width_mm": 8, "height_mm": 5,
+        }])
+        sketch_id = sketch["result"]["sketch_id"]
+        session = successful_helper_result(self, self.helper_call(helper, "model.get_session", {
+            "ownership_id": owner, "binding_epoch": epoch,
+        }))
+        operation_id = "f12-normalized-alias-" + uuid.uuid4().hex
+        legacy = self.prepare_extrude_args(
+            operation_id, owner, epoch, session["revision_id"], sketch_id,
+            mode="create", direction="positive", extent="finite", depth_mm=5.0,
+        )
+        legacy_response = successful_helper_result(self, self.helper_call(helper, "operation.prepare_extrude", legacy))
+        legacy_plan = legacy_response["result"]["plan"]
+        counts_after_legacy = self.fake_counts()
+        aliases = self.prepare_extrude_args(
+            operation_id, owner, epoch, session["revision_id"], sketch_id,
+            mode="create", direction="positive", extent="finite",
+            start_offset_mm=0.0, end_offset_mm=5.0,
+        )
+        alias_response = successful_tool_result(self, call_tool(host, "nx_prepare_extrude", aliases))
+        alias_plan = alias_response["result"]["plan"]
+        counts_after_alias = self.fake_counts()
+        self.assertEqual(legacy_plan["plan_id"], alias_plan["plan_id"], alias_plan)
+        self.assertEqual(alias_plan.get("profile_output"), "solid", alias_plan)
+        self.assertEqual(alias_plan.get("start_offset_mm"), 0.0, alias_plan)
+        self.assertEqual(alias_plan.get("end_offset_mm"), 5.0, alias_plan)
+        self.assertEqual(counts_after_alias.get("m3_extrude_prepare_calls"),
+                         counts_after_legacy.get("m3_extrude_prepare_calls"), counts_after_alias)
+
+        conflict = self.helper_call(helper, "operation.prepare_extrude", self.prepare_extrude_args(
+            operation_id, owner, epoch, session["revision_id"], sketch_id,
+            mode="create", direction="positive", extent="finite",
+            start_offset_mm=0.0, end_offset_mm=6.0,
+        ))
+        self.assertEqual(conflict.get("error", {}).get("code"), "OPERATION_ID_CONFLICT", conflict)
+        self.assertEqual(self.fake_counts().get("m3_extrude_prepare_calls"),
+                         counts_after_alias.get("m3_extrude_prepare_calls"), self.fake_counts())
+
+        execute_id, _, executed = self.execute_plan(helper, owner, epoch, legacy_plan["plan_id"])
+        self.assertEqual(executed.get("state"), "SUCCEEDED", executed)
+        self.assertEqual(executed.get("result", {}).get("mutation_state"), "APPLIED", executed)
+        verified = self.verify_plan(helper, host, owner, epoch, execute_id)
+        self.assertTrue(all(check.get("status") == "VERIFIED" for check in verified["result"]["checks"].values()), verified)
+        record("F12-legacy-offset-normalized-operation-key", {
+            "legacy_depth_mm": 5.0, "offset_interval_mm": [0.0, 5.0],
+            "normalized_profile_output": alias_plan.get("profile_output"),
+            "same_operation_id_reused_same_plan": True,
+            "adapter_prepare_calls_not_duplicated": True,
+            "conflicting_interval_error": conflict["error"]["code"],
+            "execute_state": executed["state"], "verified_checks": sorted(verified["result"]["checks"]),
+        })
+
+    def test_f12_offset_rollback_and_unknown_lifecycle_do_not_replay_mutations(self):
+        ready = self.start_harness()
+        helper = self.start_helper()
+        grant = self.takeover(ready, helper=helper)
+        owner, epoch = grant["ownership_id"], grant["binding_epoch"]
+        sketch = self.create_sketch(helper, owner, epoch, [{
+            "id": "f12-lifecycle-profile", "type": "rectangle", "corner_mm": [0, 0],
+            "width_mm": 10, "height_mm": 6,
+        }])
+        sketch_id = sketch["result"]["sketch_id"]
+        session = successful_helper_result(self, self.helper_call(helper, "model.get_session", {
+            "ownership_id": owner, "binding_epoch": epoch,
+        }))
+        _, _, prepared = self.prepare_extrude(
+            helper, owner, epoch, sketch_id, mode="create", direction="positive", extent="finite",
+            start_offset_mm=-2.0, end_offset_mm=4.0, profile_output="solid",
+        )
+        counts_before_rollback = self.fake_counts()
+        self.harness_command("rollback-after-write")
+        rollback_id, _, rolled_back = self.execute_plan(
+            helper, owner, epoch, prepared["result"]["plan"]["plan_id"],
+        )
+        self.assertEqual(rolled_back.get("state"), "FAILED", rolled_back)
+        self.assertEqual(rolled_back.get("error", {}).get("code"), "EDIT_NOT_VERIFIED", rolled_back)
+        self.assertEqual(rolled_back.get("result", {}).get("mutation_state"), "ROLLED_BACK", rolled_back)
+        self.assertEqual(rolled_back.get("result", {}).get("body_inventory"), [], rolled_back)
+        replay_rollback = self.get_operation(helper, rollback_id)
+        self.assertEqual(replay_rollback.get("state"), "FAILED", replay_rollback)
+        self.assertEqual(self.fake_counts().get("m3_execution_calls"), counts_before_rollback.get("m3_execution_calls") + 1,
+                         self.fake_counts())
+
+        _, _, unknown_prepared = self.prepare_extrude(
+            helper, owner, epoch, sketch_id, mode="create", direction="negative", extent="finite",
+            start_offset_mm=-1.0, end_offset_mm=3.0, profile_output="solid",
+        )
+        before_unknown = self.fake_counts()["m3_execution_calls"]
+        self.harness_command("unknown-after-mutation")
+        unknown_id, _, unknown = self.execute_plan(
+            helper, owner, epoch, unknown_prepared["result"]["plan"]["plan_id"],
+        )
+        self.assertEqual(unknown.get("state"), "UNKNOWN", unknown)
+        self.assertEqual(unknown.get("result", {}).get("mutation_state"), "UNKNOWN", unknown)
+        replay_unknown = successful_helper_result(self, self.helper_call(helper, "operation.execute_plan", {
+            "operation_id": unknown_id, "ownership_id": owner, "binding_epoch": epoch,
+            "plan_id": unknown_prepared["result"]["plan"]["plan_id"],
+        }))
+        self.assertEqual(replay_unknown.get("state"), "UNKNOWN", replay_unknown)
+        blocked = self.helper_call(helper, "operation.execute_plan", {
+            "operation_id": "f12-blocked-after-unknown-" + uuid.uuid4().hex,
+            "ownership_id": owner, "binding_epoch": epoch,
+            "plan_id": unknown_prepared["result"]["plan"]["plan_id"],
+        })
+        self.assertIn(blocked.get("error", {}).get("code"), {"OPERATION_OUTCOME_UNKNOWN", "CLIENT_OUTCOME_UNKNOWN"}, blocked)
+        self.assertEqual(self.fake_counts().get("m3_execution_calls"), before_unknown + 1, self.fake_counts())
+        record("F12-offset-rollback-unknown-no-replay", {
+            "known_rollback_state": rolled_back["result"]["mutation_state"],
+            "same_id_rollback_query_state": replay_rollback["state"],
+            "unknown_state": unknown["state"], "same_id_unknown_query_state": replay_unknown["state"],
+            "new_write_blocked_error": blocked["error"]["code"], "m3_execution_calls_for_unknown": 1,
+        })
+
+    def test_f12_prepare_unknown_freezes_writes_and_same_id_is_query_only(self):
+        ready = self.start_harness()
+        helper = self.start_helper()
+        grant = self.takeover(ready, helper=helper)
+        owner, epoch = grant["ownership_id"], grant["binding_epoch"]
+        sketch = self.create_sketch(helper, owner, epoch, [{
+            "id": "f12-prepare-unknown-profile", "type": "rectangle", "corner_mm": [0, 0],
+            "width_mm": 12, "height_mm": 8,
+        }])
+        sketch_id = sketch["result"]["sketch_id"]
+        session = successful_helper_result(self, self.helper_call(helper, "model.get_session", {
+            "ownership_id": owner, "binding_epoch": epoch,
+        }))
+        operation_id = "f12-prepare-unknown-" + uuid.uuid4().hex
+        args = self.prepare_extrude_args(
+            operation_id, owner, epoch, session["revision_id"], sketch_id,
+            mode="create", direction="positive", extent="finite", depth_mm=5.0,
+            profile_output="solid",
+        )
+        before = self.fake_counts()
+        self.assertEqual(before.get("m3_extrude_prepare_calls"), 0, before)
+        injected = self.harness_command("unknown-next-m3-prepare")
+        self.assertEqual(injected.get("event"), "unknown-next-m3-prepare", injected)
+
+        prepare = successful_helper_result(self, self.helper_call(helper, "operation.prepare_extrude", args))
+        self.assertEqual(prepare.get("state"), "UNKNOWN", prepare)
+        self.assertEqual(prepare.get("error", {}).get("code"), "M3_ANALYSIS_STATE_UNKNOWN", prepare)
+        self.assertIs(prepare.get("writes_halted"), True, prepare)
+        status = successful_helper_result(self, self.helper_call(helper, "bridge.status", {}))
+        self.assertIs(status.get("writes_halted"), True, status)
+        self.assertIs(status.get("model_write_enabled"), False, status)
+        self.assertEqual(status.get("ownership_state"), "UNKNOWN_FROZEN", status)
+        self.assertEqual(status.get("write_halt_reason"), "M3_ANALYSIS_STATE_UNKNOWN", status)
+
+        queried = self.get_operation(helper, operation_id)
+        self.assertEqual(queried.get("state"), "UNKNOWN", queried)
+        self.assertEqual(queried.get("error", {}).get("code"), "M3_ANALYSIS_STATE_UNKNOWN", queried)
+        replay = successful_helper_result(self, self.helper_call(helper, "operation.prepare_extrude", args))
+        self.assertEqual(replay.get("state"), "UNKNOWN", replay)
+        self.assertEqual(replay.get("error", {}).get("code"), "M3_ANALYSIS_STATE_UNKNOWN", replay)
+
+        blocked_args = dict(args)
+        blocked_args["operation_id"] = "f12-prepare-blocked-" + uuid.uuid4().hex
+        blocked = self.helper_call(helper, "operation.prepare_extrude", blocked_args)
+        self.assertEqual(blocked.get("error", {}).get("code"), "OPERATION_OUTCOME_UNKNOWN", blocked)
+        after = self.fake_counts()
+        self.assertEqual(after.get("m3_extrude_prepare_calls"), before.get("m3_extrude_prepare_calls") + 1, after)
+        self.assertEqual(after.get("m3_execution_calls"), before.get("m3_execution_calls"), after)
+        self.assertEqual(after.get("m3_mutation_count"), before.get("m3_mutation_count"), after)
+        self.assertEqual(after.get("m3_sketch_count"), before.get("m3_sketch_count"), after)
+        self.assertEqual(after.get("m3_body_count"), before.get("m3_body_count"), after)
+        self.assertEqual(after.get("revision_id"), before.get("revision_id"), after)
+        record("F12-prepare-unknown-freeze-and-query-only", {
+            "operation_id": operation_id,
+            "operation_state": prepare["state"],
+            "error_code": prepare["error"]["code"],
+            "writes_halted": status["writes_halted"],
+            "ownership_state": status["ownership_state"],
+            "same_id_operation_get_state": queried["state"],
+            "same_id_prepare_replay_state": replay["state"],
+            "new_write_rejection": blocked["error"]["code"],
+            "adapter_prepare_calls_for_unknown": after["m3_extrude_prepare_calls"] - before["m3_extrude_prepare_calls"],
+            "adapter_execute_calls": after["m3_execution_calls"],
+            "mutation_count_unchanged": after["m3_mutation_count"] == before["m3_mutation_count"],
+            "revision_unchanged": after["revision_id"] == before["revision_id"],
+        })
+
+    def test_f12_invalid_extent_and_output_combinations_reject_before_adapter(self):
+        ready = self.start_harness()
+        helper = self.start_helper()
+        grant = self.takeover(ready, helper=helper)
+        owner, epoch = grant["ownership_id"], grant["binding_epoch"]
+        session = successful_helper_result(self, self.helper_call(helper, "model.get_session", {
+            "ownership_id": owner, "binding_epoch": epoch,
+        }))
+        base = {
+            "operation_id": "f12-invalid-", "ownership_id": owner, "binding_epoch": epoch,
+            "revision_id": session["revision_id"], "sketch_id": "unresolved",
+            "mode": "create", "direction": "positive", "extent": "finite",
+        }
+        invalid = [
+            {**base, "operation_id": "f12-sheet-unite-" + uuid.uuid4().hex, "mode": "unite",
+             "target_body_id": "body-1", "profile_output": "sheet", "depth_mm": 5.0},
+            {**base, "operation_id": "f12-through-create-" + uuid.uuid4().hex, "extent": "through_all",
+             "target_body_id": "body-1"},
+            {**base, "operation_id": "f12-offset-start-only-" + uuid.uuid4().hex, "start_offset_mm": -1.0},
+            {**base, "operation_id": "f12-offset-end-only-" + uuid.uuid4().hex, "end_offset_mm": 5.0},
+            {**base, "operation_id": "f12-depth-and-offset-" + uuid.uuid4().hex, "depth_mm": 5.0,
+             "start_offset_mm": 0.0, "end_offset_mm": 5.0},
+            {**base, "operation_id": "f12-reversed-offset-" + uuid.uuid4().hex,
+             "start_offset_mm": 6.0, "end_offset_mm": 5.0},
+            {**base, "operation_id": "f12-zero-depth-" + uuid.uuid4().hex, "depth_mm": 0.0},
+            {**base, "operation_id": "f12-through-sheet-" + uuid.uuid4().hex, "mode": "subtract",
+             "extent": "through_all", "target_body_id": "body-1", "profile_output": "sheet"},
+        ]
+        for args in invalid:
+            response = self.helper_call(helper, "operation.prepare_extrude", args)
+            self.assertEqual(response.get("error", {}).get("code"), "INVALID_REQUEST", response)
+        counts = self.fake_counts()
+        self.assertEqual(counts.get("m3_extrude_prepare_calls"), 0, counts)
+        self.assertEqual(counts.get("m3_execution_calls"), 0, counts)
+        record("F12-invalid-offset-output-extent-before-adapter", {
+            "invalid_case_count": len(invalid), "adapter_prepare_calls": 0, "execute_calls": 0,
+            "invalid_categories": ["sheet_boolean", "through_all_create", "incomplete_offsets",
+                                   "mixed_depth_and_offset", "reversed_interval", "zero_depth", "sheet_through_all"],
+        })
+
     def test_direct_helper_rejects_invalid_sketch_and_extrude_requests_before_adapter(self):
         ready = self.start_harness()
         helper = self.start_helper()
@@ -544,6 +832,8 @@ class M3BridgeSubsystemTests(unittest.TestCase):
         invalid_requests = [
             self.prepare_sketch_args("m3-invalid-plane-" + uuid.uuid4().hex, owner, epoch, revision,
                                      geometries, plane="AB"),
+            self.prepare_sketch_args("m3-invalid-constraint-mode-" + uuid.uuid4().hex, owner, epoch,
+                                     revision, geometries, constraint_mode="infer"),
             self.prepare_sketch_args("m3-zero-line-" + uuid.uuid4().hex, owner, epoch, revision, [{
                 "id": "zero", "type": "line", "start_mm": [2.0, 3.0], "end_mm": [2.0, 3.0],
             }]),
@@ -653,6 +943,150 @@ class M3BridgeSubsystemTests(unittest.TestCase):
             "writes_halted_after_fixture_rollback_state": status["writes_halted"],
             "fresh_execute_operation_id": retry_id,
             "retest_state": retry["state"],
+        })
+
+    def test_unknown_m3_profile_verification_freezes_future_writes(self):
+        ready = self.start_harness()
+        helper = self.start_helper()
+        grant = self.takeover(ready, helper=helper)
+        owner, epoch = grant["ownership_id"], grant["binding_epoch"]
+        session = successful_helper_result(self, self.helper_call(helper, "model.get_session", {
+            "ownership_id": owner, "binding_epoch": epoch,
+        }))
+        prepared = successful_helper_result(self, self.helper_call(helper, "operation.prepare_sketch",
+            self.prepare_sketch_args("unknown-verify-prepare-" + uuid.uuid4().hex, owner, epoch,
+                session["revision_id"], [{
+                    "id": "unknown-verify-profile", "type": "rectangle", "corner_mm": [0.0, 0.0],
+                    "width_mm": 8.0, "height_mm": 5.0,
+                }])))
+        execute_id, _, executed = self.execute_plan(helper, owner, epoch,
+            prepared["result"]["plan"]["plan_id"])
+        self.assertEqual(executed.get("state"), "SUCCEEDED", executed)
+
+        next_session = successful_helper_result(self, self.helper_call(helper, "model.get_session", {
+            "ownership_id": owner, "binding_epoch": epoch,
+        }))
+        blocked_plan = successful_helper_result(self, self.helper_call(helper, "operation.prepare_sketch",
+            self.prepare_sketch_args("unknown-verify-followup-" + uuid.uuid4().hex, owner, epoch,
+                next_session["revision_id"], [{
+                    "id": "followup-profile", "type": "line", "start_mm": [20.0, 0.0], "end_mm": [24.0, 0.0],
+                }])))
+        before_verify = self.fake_counts()
+        self.harness_command("unknown-next-m3-verification")
+        verify_id = "m3-unknown-verify-" + uuid.uuid4().hex
+        verify_args = {
+            "operation_id": verify_id,
+            "ownership_id": owner,
+            "binding_epoch": epoch,
+            "execute_operation_id": execute_id,
+        }
+        verify_accepted = successful_helper_result(self, self.helper_call(helper, "operation.verify_part", verify_args))
+        self.assertIn(verify_accepted.get("state"), {"QUEUED", "RUNNING", "UNKNOWN"}, verify_accepted)
+        unknown = self.wait_operation(helper, verify_id)
+        self.assertEqual(unknown.get("state"), "UNKNOWN", unknown)
+        self.assertEqual(unknown.get("error", {}).get("code"), "M3_ANALYSIS_STATE_UNKNOWN", unknown)
+        self.assertEqual(unknown.get("result", {}).get("verification_state"), "UNKNOWN", unknown)
+
+        after_unknown = self.fake_counts()
+        self.assertEqual(after_unknown.get("m3_verification_calls"),
+                         before_verify.get("m3_verification_calls", 0) + 1, after_unknown)
+        self.assertEqual(after_unknown.get("m3_mutation_count"), before_verify.get("m3_mutation_count"), after_unknown)
+        same_id_replay = successful_helper_result(
+            self, self.helper_call(helper, "operation.verify_part", verify_args))
+        self.assertEqual(same_id_replay.get("state"), "UNKNOWN", same_id_replay)
+        self.assertEqual(same_id_replay.get("error", {}).get("code"), "M3_ANALYSIS_STATE_UNKNOWN", same_id_replay)
+        queried = self.get_operation(helper, verify_id)
+        self.assertEqual(queried.get("state"), "UNKNOWN", queried)
+        self.assertEqual(queried.get("error", {}).get("code"), "M3_ANALYSIS_STATE_UNKNOWN", queried)
+        after_same_id_queries = self.fake_counts()
+        self.assertEqual(after_same_id_queries.get("m3_verification_calls"),
+                         after_unknown.get("m3_verification_calls"), after_same_id_queries)
+        self.assertEqual(after_same_id_queries.get("m3_mutation_count"),
+                         after_unknown.get("m3_mutation_count"), after_same_id_queries)
+
+        status = successful_helper_result(self, self.helper_call(helper, "bridge.status", {}))
+        self.assertIs(status.get("writes_halted"), True, status)
+        self.assertEqual(status.get("ownership_state"), "UNKNOWN_FROZEN", status)
+        blocked = self.helper_call(helper, "operation.execute_plan", {
+            "operation_id": "m3-blocked-after-unknown-verify-" + uuid.uuid4().hex,
+            "ownership_id": owner,
+            "binding_epoch": epoch,
+            "plan_id": blocked_plan["result"]["plan"]["plan_id"],
+        })
+        self.assertEqual(blocked.get("error", {}).get("code"), "OPERATION_OUTCOME_UNKNOWN", blocked)
+        counts = self.fake_counts()
+        self.assertEqual(counts.get("m3_execution_calls"), 1, counts)
+        self.assertEqual(counts.get("m3_verification_calls"), after_unknown.get("m3_verification_calls"), counts)
+        self.assertEqual(counts.get("m3_mutation_count"), before_verify.get("m3_mutation_count"), counts)
+        record("M3-profile-verify-unknown-freeze", {
+            "verify_operation_id": verify_id,
+            "verify_state": unknown["state"],
+            "verify_error": unknown["error"]["code"],
+            "same_id_verify_replay_state": same_id_replay["state"],
+            "same_id_verify_replay_error": same_id_replay["error"]["code"],
+            "same_id_operation_get_state": queried["state"],
+            "same_id_queries_replayed_verification": False,
+            "mutation_count_unchanged_by_unknown_read": counts["m3_mutation_count"] == before_verify["m3_mutation_count"],
+            "writes_halted": status["writes_halted"],
+            "blocked_execute_error": blocked["error"]["code"],
+            "execution_calls": counts["m3_execution_calls"],
+            "verification_calls": counts["m3_verification_calls"],
+        })
+
+    def test_m3_profile_verification_mismatch_does_not_freeze_future_writes(self):
+        ready = self.start_harness()
+        helper = self.start_helper()
+        grant = self.takeover(ready, helper=helper)
+        owner, epoch = grant["ownership_id"], grant["binding_epoch"]
+        session = successful_helper_result(self, self.helper_call(helper, "model.get_session", {
+            "ownership_id": owner, "binding_epoch": epoch,
+        }))
+        prepared = successful_helper_result(self, self.helper_call(helper, "operation.prepare_sketch",
+            self.prepare_sketch_args("mismatch-verify-prepare-" + uuid.uuid4().hex, owner, epoch,
+                session["revision_id"], [{
+                    "id": "mismatch-verify-profile", "type": "rectangle", "corner_mm": [0.0, 0.0],
+                    "width_mm": 8.0, "height_mm": 5.0,
+                }])))
+        execute_id, _, executed = self.execute_plan(helper, owner, epoch,
+            prepared["result"]["plan"]["plan_id"])
+        self.assertEqual(executed.get("state"), "SUCCEEDED", executed)
+
+        self.harness_command("mismatch-next-m3-verification")
+        verify_id = "m3-mismatch-verify-" + uuid.uuid4().hex
+        accepted = successful_helper_result(self, self.helper_call(helper, "operation.verify_part", {
+            "operation_id": verify_id,
+            "ownership_id": owner,
+            "binding_epoch": epoch,
+            "execute_operation_id": execute_id,
+        }))
+        self.assertIn(accepted.get("state"), {"QUEUED", "RUNNING"}, accepted)
+        mismatch = self.wait_operation(helper, verify_id)
+        self.assertEqual(mismatch.get("state"), "FAILED", mismatch)
+        self.assertEqual(mismatch.get("error", {}).get("code"), "PART_VERIFICATION_FAILED", mismatch)
+        self.assertIs(mismatch.get("result", {}).get("verified"), False, mismatch)
+        status = successful_helper_result(self, self.helper_call(helper, "bridge.status", {}))
+        self.assertIs(status.get("writes_halted"), False, status)
+
+        next_session = successful_helper_result(self, self.helper_call(helper, "model.get_session", {
+            "ownership_id": owner, "binding_epoch": epoch,
+        }))
+        next_prepared = successful_helper_result(self, self.helper_call(helper, "operation.prepare_sketch",
+            self.prepare_sketch_args("mismatch-verify-followup-" + uuid.uuid4().hex, owner, epoch,
+                next_session["revision_id"], [{
+                    "id": "followup-profile", "type": "line", "start_mm": [20.0, 0.0], "end_mm": [24.0, 0.0],
+                }])))
+        _, _, retry = self.execute_plan(helper, owner, epoch,
+            next_prepared["result"]["plan"]["plan_id"])
+        self.assertEqual(retry.get("state"), "SUCCEEDED", retry)
+        final_status = successful_helper_result(self, self.helper_call(helper, "bridge.status", {}))
+        self.assertIs(final_status.get("writes_halted"), False, final_status)
+        record("M3-profile-verify-mismatch-write-enabled", {
+            "verify_operation_id": verify_id,
+            "verify_state": mismatch["state"],
+            "verify_error": mismatch["error"]["code"],
+            "writes_halted_after_mismatch": status["writes_halted"],
+            "followup_execute_state": retry["state"],
+            "writes_halted_after_followup": final_status["writes_halted"],
         })
 
     def test_unknown_m3_result_freezes_writes_and_ownership(self):

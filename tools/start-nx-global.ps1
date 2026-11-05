@@ -19,12 +19,21 @@ function Test-AbsoluteWindowsPath([string] $PathValue) {
     return $PathValue -match '^(?:[A-Za-z]:[\\/]|\\\\[^\\/]+[\\/][^\\/]+[\\/])'
 }
 
+function Get-NxEnvironmentOverride([string] $ProcessValue, [string] $UserValue, [string] $MachineValue) {
+    # Preserve explicit per-process settings, including session-specific choices.
+    if (-not [string]::IsNullOrWhiteSpace($ProcessValue)) { return $null }
+    if (-not [string]::IsNullOrWhiteSpace($UserValue)) { return $UserValue }
+    if (-not [string]::IsNullOrWhiteSpace($MachineValue)) { return $MachineValue }
+    return $null
+}
+
 function Get-RunningNx {
     return @(Get-Process -Name 'ugraf' -ErrorAction SilentlyContinue)
 }
 
 $failureCode = 'LAUNCH_FAILED'
 $launchMutex = $null
+$journalGate = $null
 $mutexAcquired = $false
 try {
     if ([string]::IsNullOrWhiteSpace($Config)) {
@@ -80,6 +89,25 @@ try {
     if (-not $mutexAcquired) {
         Write-LaunchResult @{state='STARTING'; ready=$false; code='STARTUP_IN_PROGRESS';
             message='Another launcher is preparing NX for this Windows user. Retry nx_ensure_ready.'}
+        exit 0
+    }
+
+    # The same exclusive file gate is held for the entire standalone Journal run.
+    # A durable marker survives a crashed supervisor and deliberately blocks startup.
+    $coordinationRoot = Join-Path ([Environment]::GetFolderPath('UserProfile')) '.codex/nx-sketch-mcp/journal-coordination'
+    [IO.Directory]::CreateDirectory($coordinationRoot) | Out-Null
+    $failureCode = 'JOURNAL_COORDINATION_UNAVAILABLE'
+    try {
+        $journalGate = [IO.File]::Open((Join-Path $coordinationRoot 'gate.lock'), [IO.FileMode]::OpenOrCreate,
+            [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+    } catch {
+        Write-LaunchResult @{state='NEEDS_MANUAL_ACTION'; ready=$false; code='JOURNAL_COORDINATION_BUSY';
+            message='A Journal or launcher holds the shared coordination gate; no NX process was changed.'}
+        exit 0
+    }
+    if (Test-Path -LiteralPath (Join-Path $coordinationRoot 'active.json')) {
+        Write-LaunchResult @{state='NEEDS_MANUAL_ACTION'; ready=$false; code='JOURNAL_OUTCOME_UNRESOLVED';
+            message='A persistent Journal activity marker exists. Inspect the operation before any manual recovery; it is never cleared automatically.'}
         exit 0
     }
 
@@ -144,6 +172,22 @@ try {
         NX_SKETCH_MCP_M2_ENTRY_DLL = $entryPath
         UGII_USER_DIR = (Split-Path -Parent $startupPath)
     }
+    # Only these two NX settings receive fallbacks when the host filtered them.
+    # Explicit process settings win; never persist user or machine changes.
+    foreach ($name in @('SPLM_LICENSE_SERVER', 'UGII_LANG')) {
+        $processValue = [Environment]::GetEnvironmentVariable($name, 'Process')
+        if ([string]::IsNullOrWhiteSpace($processValue)) {
+            $userValue = [Environment]::GetEnvironmentVariable($name, 'User')
+            $machineValue = $null
+            if ([string]::IsNullOrWhiteSpace($userValue)) {
+                $machineValue = [Environment]::GetEnvironmentVariable($name, 'Machine')
+            }
+            $fallback = Get-NxEnvironmentOverride -ProcessValue $processValue -UserValue $userValue -MachineValue $machineValue
+            if (-not [string]::IsNullOrWhiteSpace($fallback)) {
+                $childEnvironment[$name] = $fallback
+            }
+        }
+    }
     $previousEnvironment = @{}
     try {
         foreach ($key in $childEnvironment.Keys) {
@@ -169,6 +213,7 @@ catch {
     exit 1
 }
 finally {
+    if ($null -ne $journalGate) { $journalGate.Dispose() }
     if ($null -ne $launchMutex) {
         if ($mutexAcquired) { $launchMutex.ReleaseMutex() }
         $launchMutex.Dispose()

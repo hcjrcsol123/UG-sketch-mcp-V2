@@ -113,6 +113,7 @@ class NxReadinessTests(unittest.TestCase):
             self.assertLessEqual(clock[0], 1.0)
             launch.assert_called_once()
             state_file = next(self.private.glob("ready-*.json"))
+            self.assertEqual(state_file.name, "ready-nx-ready-test.json")
             self.assertEqual(json.loads(state_file.read_text()), {"nx_pid": 123, "process_start_ticks": "456"})
             self.bridge.call.side_effect = [self.disconnected(), self.disconnected(), self.disconnected(), {"ownership_state": "HUMAN_OWNED"}]
             launch.return_value = {"state": "EXISTING_MANAGED", "nx_pid": 123, "process_start_ticks": "456"}
@@ -338,7 +339,12 @@ class NxReadinessTests(unittest.TestCase):
             self.assertEqual(status["unknown_operation_ids"], ["previous-unknown-write"])
             self.assertEqual(server._unknown_operation_ids, {"previous-unknown-write"})
         tools = {item["name"]: item for item in TOOLS}
-        self.assertEqual(len(tools), 20)
+        self.assertEqual(len(TOOLS), len(tools))
+        self.assertIn("nx_prepare_datum_plane", tools)
+        self.assertIn("nx_prepare_sketch_corner", tools)
+        self.assertIn("nx_edit_sketch_corner", tools)
+        self.assertIn("nx_prepare_sketch_offset", tools)
+        self.assertIn("nx_edit_sketch_offset", tools)
         self.assertFalse(tools["nx_ensure_ready"]["annotations"]["readOnlyHint"])
 
     def test_helper_reset_disposes_only_own_helper_and_does_not_replay_calls(self):

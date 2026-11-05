@@ -77,5 +77,3 @@
 - `tests/nx/M7Acceptance.cs`：独立测试零件中调用生产C#适配器，验证实体螺纹、不同主轴及左右旋螺旋槽、非目标实体与保存重开。通过 `tests/nx/build-m7-acceptance.ps1` 仅编译，不自动启动NX；实际运行需要独立NX验证会话授权。
 
 更新安装目录的Python源码和DLL后，重新连接MCP以发现20个工具。已经加载旧DLL的NX会话须正常保存退出后从MCP专用入口重新启动；不做热替换、进程强杀或未知状态自动解冻。
-
-本次实现的已有离线结果：84项桥接/协议回归和26项单元测试全部通过；NX2506生产DLL及独立实机验证DLL已编译；已安装文件与源码产物逐一SHA256一致，新启动的安装版MCP确认版本0.3.0和20个工具。用户已要求本次跳过测试，仅更新全局安装与本地原项目；因此不再等待实机测试授权，也未启动NX验证。之前蜗杆Python Journal建模成功不替代新C#功能的实机验证。记录位于 `workspace/build/current/M2/m7-validation.json` 和 `m7-installed-discovery.json`。

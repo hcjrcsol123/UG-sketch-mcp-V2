@@ -119,10 +119,16 @@ namespace NxSketchMcp.M2
     public sealed class M2ModelException : Exception
     {
         public readonly string Code;
+        public readonly Dictionary<string, object> Diagnostics;
 
-        public M2ModelException(string code, string message) : base(message)
+        public M2ModelException(string code, string message) : this(code, message, null)
+        {
+        }
+
+        public M2ModelException(string code, string message, Dictionary<string, object> diagnostics) : base(message)
         {
             Code = String.IsNullOrEmpty(code) ? "MODEL_READ_FAILED" : code;
+            Diagnostics = diagnostics;
         }
     }
 }
